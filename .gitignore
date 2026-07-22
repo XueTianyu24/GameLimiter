@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时数据（游玩记录等，不进 git）
+*.db
+*.sqlite3
+
+# 打包产物
+build/
+dist/
+*.spec
