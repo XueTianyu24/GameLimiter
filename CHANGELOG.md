@@ -2,6 +2,39 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.6.0] — 2026-07-23
+
+**改了什么**
+- Steam 游戏支持：GUI「选文件」新增识别 Steam 桌面图标(.url) → 解析 appid → 扫本机所有 Steam 库定位安装目录 → 智能挑真实游戏 exe（多候选弹选择框，已排序）
+- 处理虚幻引擎双层 exe：`Palworld.exe`(启动器) vs `Palworld-Win64-Shipping.exe`(真实长驻进程)——Shipping 版优先；剔除 crashhandler/vcredist/EAC 等干扰 exe
+- 非 Steam 商店游戏的 .url（64 位伪 id）与网页 .url 给出明确引导，让用户改用「运行中进程」方式
+
+**关键改动文件**
+- `gamelimiter/steam.py`（注册表找根 + libraryfolders.vdf 多库 + appmanifest.acf + exe 候选排序）
+- `gamelimiter/gui.py`（.url 分支 + 多候选选择对话框）、`tests/test_steam.py`（合成夹具全覆盖）
+
+**设计决策**
+- 限制作用于游戏进程本身，与启动器无关（Steam 拉起的游戏照常被 exe 进程名监控/查杀）；Steam 解析只解决"怎么把正确 exe 加进清单"
+- exe 候选排序键：UE Shipping 版 > 与安装目录同名 > 体积大者；rglob 限 4 层深 + 目录/文件名双重 junk 过滤
+- 多候选时不自动决定，弹选择框（已按可能性排序，默认选第一个）——避免误选启动器/子工具
+
+**验证**
+- `tests/test_steam.py` 全过（.url 解析含伪 id/网页排除、跨库定位、UE 双层 exe 排序、干扰项剔除）
+- 本机真实 Steam 库实测：注册表定位 + acf 解析 + exe 候选全链路通
+
+## [v0.5.1] — 2026-07-23
+
+**改了什么**
+- 开源发布基建：公开仓 XueTianyu24/GameLimiter 上线（main + tag v0.5.0 + Release draft 含单 exe）
+- `scripts/export_public.py`：白名单导出到平级工作副本 + 敏感串 grep 门禁（本机用户名/私人称呼），脚本自身不导出
+- `publish/`：公开版 README（安装三步 + 防绕过说明 + SmartScreen 提示）与 MIT LICENSE 的真相源
+
+**设计决策**
+- 开发仓与公开仓分离：开发文档含本机路径/私人信息，公开仓只收代码 + CHANGELOG + publish 文档，全新独立历史；公开 commit 用仓库级身份 XueTianyu24 + noreply 邮箱
+
+**验证**
+- 导出脚本跑通（clone + 同步 + 门禁通过）；`git add` 后 status 归零证明内容与已推送版本一致；Release asset 上传成功
+
 ## [v0.5.0] — 2026-07-23
 
 **改了什么**

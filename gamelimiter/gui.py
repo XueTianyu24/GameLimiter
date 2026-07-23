@@ -15,7 +15,7 @@ from pathlib import Path
 import psutil
 from nicegui import app, run, ui
 
-from . import changes, db, rules, setup_system
+from . import changes, db, rules, setup_system, steam
 from .winutil import DAEMON_MUTEX, mutex_exists, run_elevated, spawn_detached
 
 conn = db.connect()
@@ -271,7 +271,48 @@ def open_add_dialog():
                             dlg.close()
                     ui.button("添加", on_click=add_from_proc)
             with ui.tab_panel(t2):
-                ui.label("选择游戏 exe 或桌面快捷方式(.lnk)").classes("text-sm text-slate-500")
+                ui.label("选择游戏 exe、快捷方式(.lnk) 或 Steam 桌面图标(.url)") \
+                    .classes("text-sm text-slate-500")
+
+                def add_from_steam(picked: str) -> bool:
+                    """Steam .url 图标 → 库解析 → 挑 exe（多候选弹选择框）。"""
+                    appid = steam.parse_url_shortcut(picked)
+                    if appid is None:
+                        ui.notify("不是 Steam 商店游戏的图标，请改用「运行中进程」方式添加",
+                                  type="warning")
+                        return False
+                    found = steam.find_game(appid)
+                    if not found:
+                        ui.notify("本机 Steam 库中未找到该游戏（未安装或库不在本机）",
+                                  type="warning")
+                        return False
+                    name, install_dir = found
+                    cands = steam.candidate_exes(install_dir)
+                    if not cands:
+                        ui.notify(f"{install_dir} 下没找到可用 exe，请用「运行中进程」方式",
+                                  type="warning")
+                        return False
+                    if len(cands) == 1:
+                        return add_game(name, cands[0].name, str(cands[0]))
+                    with ui.dialog() as pick_dlg, ui.card().classes("w-[420px]"):
+                        ui.label(f"「{name}」找到多个 exe，选真正的游戏进程：") \
+                            .classes("font-bold")
+                        opts = {str(p): f"{p.name}（{p.stat().st_size/1e6:.0f} MB）"
+                                for p in cands[:8]}
+                        sel2 = ui.select(opts, value=str(cands[0])).classes("w-full")
+                        ui.label("已按可能性排序，第一个通常就是对的") \
+                            .classes("text-xs text-slate-400")
+                        with ui.row():
+                            ui.button("取消", on_click=pick_dlg.close).props("flat")
+
+                            def confirm():
+                                p = Path(sel2.value)
+                                if add_game(name, p.name, str(p)):
+                                    pick_dlg.close()
+                                    dlg.close()
+                            ui.button("添加", on_click=confirm)
+                    pick_dlg.open()
+                    return False   # 由选择框负责收尾
 
                 async def pick():
                     win = app.native.main_window
@@ -282,10 +323,15 @@ def open_add_dialog():
                     res = await run.io_bound(
                         win.create_file_dialog, webview.OPEN_DIALOG,
                         directory=str(Path.home() / "Desktop"),
-                        file_types=("游戏或快捷方式 (*.exe;*.lnk)",))
+                        file_types=("游戏、快捷方式或 Steam 图标 (*.exe;*.lnk;*.url)",))
                     if not res:
                         return
-                    target = resolve_lnk(res[0])
+                    picked = res[0]
+                    if picked.lower().endswith(".url"):
+                        if add_from_steam(picked):
+                            dlg.close()
+                        return
+                    target = resolve_lnk(picked)
                     if not target.lower().endswith(".exe"):
                         ui.notify("快捷方式目标不是 exe", type="warning")
                         return
