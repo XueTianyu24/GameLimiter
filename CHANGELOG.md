@@ -2,6 +2,24 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.6.1] — 2026-07-24
+
+**改了什么**
+- 修复台式机（无 conda 干净机器）启动即崩 `ImportError: DLL load failed while importing _ctypes`：conda 把标准库 C 扩展依赖的 DLL 放 `Library\bin`（且 ffi 无版本号），PyInstaller 逐个漏收集；开发机能从系统 PATH 借到所以没暴露
+- 打包脚本化：`scripts/diagnose_deps.py` 用 pefile 递归扫描全部 C 扩展(.pyd)的 import 闭包，一次揪出全部 10 个缺失 DLL（ffi/sqlite3/openssl/bz2/lzma/expat/zlib/tcl/tk）；`scripts/build_exe.py` 自动收集重打包，杜绝手敲错名和打地鼠
+- exe 新增 `--selftest` 自检钩子：加载全部关键原生依赖后打印 `selftest OK`，配合"最小 PATH"（只留 System32）在开发机模拟干净台式机验证
+
+**关键改动文件**
+- `scripts/diagnose_deps.py`（新增）、`scripts/build_exe.py`（新增）、`gamelimiter/app.py`（--selftest）、`USAGE.md`（打包配方 + 坑 3）
+
+**设计决策**
+- 不手动指定 DLL 清单而是按真实 import 名自动收集——第一次只修 ffi.dll 结果又卡 sqlite3，证明打地鼠不可靠，必须全量闭包扫描
+- 验证手段固化为"最小 PATH + --selftest"，发版前必跑，不再依赖台式机来回试错
+
+**验证**
+- 最小 PATH 下旧 exe 复现台式机同款 `_ctypes` 崩溃（证明验证手段有效）
+- 全量收集重打包后（49.9MB），最小 PATH 下 `--selftest` 通过（exit 0 + `selftest OK`）
+
 ## [v0.6.0] — 2026-07-23
 
 **改了什么**

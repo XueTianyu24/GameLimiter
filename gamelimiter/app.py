@@ -7,9 +7,23 @@
   --remove-system   移除强制层（需管理员）
   --stop-daemon     停止 watchdog + 守护（调试用；SYSTEM 化后需管理员才杀得动）
   --cli ...         命令行管理透传，如 GameLimiter.exe --cli list
+  --selftest        自检：加载所有关键原生依赖后退出（打包后验证自包含用）
 """
 
 import sys
+
+
+def _selftest():
+    """加载全部原生扩展依赖，验证打包 exe 在干净机器上自包含。
+
+    覆盖历史踩过的坑：conda 的 _ctypes 依赖 ffi.dll 漏收集时，import ctypes 就炸。
+    """
+    import ctypes  # noqa: F401  最易漏的（_ctypes → ffi.dll）
+    import sqlite3  # noqa: F401
+    import psutil  # noqa: F401
+    from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
+    from . import changes, cli, daemon, db, gui, rules, setup_system, steam, watchdog  # noqa: F401
+    print("selftest OK")
 
 
 def _stop_daemon():
@@ -52,6 +66,8 @@ def main():
     elif "--remove-system" in args:
         from .setup_system import remove
         sys.exit(0 if remove() else 1)
+    elif "--selftest" in args:
+        _selftest()
     elif "--stop-daemon" in args:
         _stop_daemon()
     elif "--cli" in args:
