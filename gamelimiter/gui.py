@@ -57,21 +57,6 @@ def game_state(g: db.Game) -> tuple[str, str, str]:
     return f"时段外 · 最近 {t} 开放", "bg-slate-200 text-slate-600", ""
 
 
-def parse_windows_input(text: str):
-    """'19:00-23:00, 22:00-01:00' -> list 或 None；格式错抛 ValueError。"""
-    text = text.replace("，", ",").strip()
-    if not text:
-        return None
-    out = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        rules._parse_window(part)   # 校验
-        out.append(part)
-    return out or None
-
-
 def daemon_running() -> bool:
     """探测守护进程的命名互斥体（与启动方式无关）。"""
     return mutex_exists(DAEMON_MUTEX)
@@ -169,21 +154,42 @@ def game_card(g: db.Game):
         upd()
         _updaters.append(upd)
 
+        multi_windows = bool(g.windows and len(g.windows) > 1)
+        cur = g.windows[0] if (g.windows and not multi_windows) else None
+        cur_start, cur_end = (cur.split("-") if cur else (None, None))
+
         ui.separator()
         with ui.row().classes("w-full gap-2 items-end"):
             cd = ui.number("冷却(小时)", value=g.cooldown_hours, min=0, step=0.5) \
                 .classes("w-[92px]").props("dense")
             sm = ui.number("单次(分钟)", value=g.session_minutes, min=0, step=5) \
                 .classes("w-[92px]").props("dense")
-            wd = ui.input("允许时段", value="、".join(g.windows) if g.windows else "") \
-                .classes("flex-grow").props('dense placeholder="如 19:00-23:00"')
+            if multi_windows:
+                # 多时段只能 CLI 设置；GUI 只读展示，避免下拉误覆盖丢数据
+                ui.label("时段 " + "、".join(g.windows) + "（多段，用 CLI 修改）") \
+                    .classes("text-xs text-slate-500 flex-grow self-center")
+                w_start = w_end = None
+            else:
+                # 半小时档 + 当前值（CLI 可能设过非整档时间）
+                t_opts = sorted({f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)}
+                                | ({cur_start, cur_end} - {None}))
+                w_start = ui.select(["不限"] + t_opts, value=cur_start or "不限",
+                                    label="时段开始").classes("w-[110px]").props("dense")
+                w_end = ui.select(t_opts, value=cur_end or "23:00", label="时段结束") \
+                    .classes("w-[110px]").props("dense")
+                w_end.visible = cur is not None
 
-        def save(gid=g.id, cd=cd, sm=sm, wd=wd):
-            try:
-                windows = parse_windows_input(wd.value.replace("、", ","))
-            except ValueError:
-                ui.notify("时段格式应为 HH:MM-HH:MM，多段用逗号分隔", type="warning")
-                return
+        def save(gid=g.id, cd=cd, sm=sm, w_start=w_start, w_end=w_end):
+            if w_start is None:                     # 多时段卡片：时段不动，只存数值项
+                windows = g.windows
+            elif w_start.value == "不限":
+                windows = None
+            else:
+                if w_start.value == w_end.value:
+                    ui.notify("开始与结束不能相同（跨午夜时段选结束 < 开始即可）",
+                              type="warning")
+                    return
+                windows = [f"{w_start.value}-{w_end.value}"]
             fresh = db._row_to_game(
                 conn.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone())
             applied, delayed = changes.request_changes(conn, fresh, {
@@ -200,9 +206,15 @@ def game_card(g: db.Game):
             else:
                 ui.notify("规则已保存并立即生效", type="positive")
             games_view.refresh()
-        for el in (cd, sm, wd):
+        for el in (cd, sm):
             el.on("blur", save)
             el.on("keydown.enter", save)
+        if w_start is not None:
+            def on_start_change(w_start=w_start, w_end=w_end):
+                w_end.visible = w_start.value != "不限"
+                save()
+            w_start.on_value_change(on_start_change)
+            w_end.on_value_change(save)
 
         pendings = db.list_pending(conn, g.id)
         if pendings:
