@@ -48,13 +48,19 @@ def spawn_detached(*args):
         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW)
 
 
-def run_elevated(*args) -> bool:
-    """UAC 提权运行本应用（一键配置用）。返回是否成功发起。"""
-    if is_frozen():
-        file, params, cwd = sys.executable, " ".join(args), None
+def run_elevated(*args, file: str | None = None) -> bool:
+    """UAC 提权运行本应用（一键配置/更新用）。返回是否成功发起。
+
+    file 指定要提权的 exe（在线更新时提权的是新下载的 exe）；缺省为当前形态。
+    """
+    quoted = " ".join(f'"{a}"' if " " in a else a for a in args)
+    if file is not None:
+        target, params, cwd = file, quoted, None
+    elif is_frozen():
+        target, params, cwd = sys.executable, quoted, None
     else:
-        file = sys.executable
-        params = "-m gamelimiter.app " + " ".join(args)
+        target = sys.executable
+        params = "-m gamelimiter.app " + quoted
         cwd = str(project_root())
-    r = ctypes.windll.shell32.ShellExecuteW(None, "runas", file, params, cwd, 1)
+    r = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, cwd, 1)
     return r > 32

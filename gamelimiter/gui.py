@@ -8,15 +8,19 @@
 """
 
 import os
+import sys
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
 import psutil
 from nicegui import app, run, ui
 
-from . import changes, db, rules, setup_system, steam
-from .winutil import DAEMON_MUTEX, mutex_exists, run_elevated, spawn_detached
+from . import changes, config, db, rules, setup_system, steam, updater
+from .version import __version__
+from .winutil import (DAEMON_MUTEX, is_frozen, mutex_exists, run_elevated,
+                      spawn_detached)
 
 conn = db.connect()
 PORT = 8788
@@ -401,6 +405,81 @@ def history_view():
         ui.button("清空记录", on_click=confirm_clear).props("flat dense color=grey").classes("mt-1")
 
 
+# ---------------- 在线更新 ----------------
+
+_IGNORE_FILE = config.DATA_DIR / "update_ignore.txt"
+_upd_prog = {"done": 0, "total": 1}
+
+
+def _ignored_tag() -> str:
+    try:
+        return _IGNORE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def open_update_dialog(info: dict):
+    with ui.dialog() as d, ui.card().classes("w-[480px] gap-2"):
+        ui.label(f"发现新版本 {info['tag']}").classes("text-lg font-bold text-slate-800")
+        ui.label(f"当前 v{__version__}").classes("text-xs text-slate-400")
+        if info["notes"]:
+            with ui.element("div").classes(
+                    "w-full max-h-48 overflow-y-auto bg-slate-50 rounded-lg p-2"):
+                ui.markdown(info["notes"])
+        prog = ui.linear_progress(value=0, show_value=False).classes("w-full")
+        prog.visible = False
+        status = ui.label("").classes("text-xs text-slate-500")
+        ui.timer(0.2, lambda: prog.set_value(
+            round(_upd_prog["done"] / max(1, _upd_prog["total"]), 3)))
+
+        async def do_update():
+            if not is_frozen():
+                ui.notify("开发环境不支持一键更新，请用打包 exe", type="warning")
+                return
+            if not info["asset_url"]:
+                ui.notify("该版本 Release 无 exe 附件，请打开下载页手动更新", type="warning")
+                return
+            btn_row.visible = False
+            prog.visible = True
+            _upd_prog.update(done=0, total=info["asset_size"] or 1)
+            dest = Path(sys.executable).with_name("GameLimiter.new.exe")
+
+            def cb(done, total):   # io 线程回调只写 dict，UI 由 timer 拉
+                _upd_prog.update(done=done, total=total or _upd_prog["total"])
+
+            try:
+                status.text = "下载中…"
+                await run.io_bound(updater.download, info["asset_url"], dest, cb)
+                status.text = "校验新版本（--selftest，首次解包约 10-60 秒）…"
+                if not await run.io_bound(updater.verify_exe, dest):
+                    raise OSError("新版本自检未通过（文件可能损坏），已中止")
+                status.text = "请在 UAC 弹窗中确认，应用将自动重启进新版…"
+                if not run_elevated("--apply-update", sys.executable, file=str(dest)):
+                    raise OSError("未通过 UAC 授权")
+                app.shutdown()
+            except Exception as e:                     # noqa: BLE001 反馈到界面
+                ui.notify(f"更新失败：{e}", type="negative")
+                status.text = ""
+                prog.visible = False
+                btn_row.visible = True
+
+        def ignore():
+            try:
+                _IGNORE_FILE.write_text(info["tag"], encoding="utf-8")
+            except OSError:
+                pass
+            d.close()
+
+        with ui.row().classes("w-full justify-end") as btn_row:
+            ui.button("稍后", on_click=d.close).props("flat color=grey")
+            ui.button("忽略此版本", on_click=ignore).props("flat color=grey")
+            ui.button("打开下载页",
+                      on_click=lambda: webbrowser.open(info["page"])).props("flat")
+            ui.button(f"立即更新（{info['asset_size'] / 1e6:.0f} MB）",
+                      icon="download", on_click=do_update).props("color=sky-500")
+    d.open()
+
+
 # ---------------- 页面 ----------------
 
 
@@ -412,6 +491,23 @@ def main_page():
         with ui.row().classes("w-full items-center gap-3"):
             ui.icon("sports_esports").classes("text-3xl text-sky-500")
             ui.label("GameLimiter").classes("text-2xl font-bold text-slate-800")
+            ui.label(f"v{__version__}").classes("text-xs text-slate-400 self-end mb-1")
+
+            async def check_updates(manual: bool = True):
+                try:
+                    info = await run.io_bound(updater.check_latest)
+                except Exception as e:               # noqa: BLE001 网络失败
+                    if manual:
+                        ui.notify(f"检查更新失败：{e}", type="warning")
+                    return
+                if info and (manual or info["tag"] != _ignored_tag()):
+                    open_update_dialog(info)
+                elif manual and not info:
+                    ui.notify(f"已是最新版本 v{__version__}", type="positive")
+            ui.button(icon="system_update_alt", on_click=check_updates) \
+                .props("flat dense round size=sm color=grey").tooltip("检查更新")
+            ui.timer(3.0, lambda: check_updates(manual=False), once=True)
+
             badge = ui.label().classes("px-2 py-0.5 rounded-full text-xs font-medium")
             start_btn = ui.button("启动守护", on_click=lambda: (start_daemon(), ui.timer(2.0, upd_badge, once=True))) \
                 .props("dense color=orange")

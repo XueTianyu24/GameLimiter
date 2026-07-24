@@ -8,6 +8,8 @@
   --stop-daemon     停止 watchdog + 守护（调试用；SYSTEM 化后需管理员才杀得动）
   --cli ...         命令行管理透传，如 GameLimiter.exe --cli list
   --selftest        自检：加载所有关键原生依赖后退出（打包后验证自包含用）
+  --apply-update P  在线更新第二段：本 exe（新版）顶替到路径 P（GUI 发起 UAC 调用）
+  --version         打印版本号
 """
 
 import sys
@@ -22,7 +24,8 @@ def _selftest():
     import sqlite3  # noqa: F401
     import psutil  # noqa: F401
     from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
-    from . import changes, cli, daemon, db, gui, rules, setup_system, steam, watchdog  # noqa: F401
+    from . import (changes, cli, daemon, db, gui, rules, setup_system,  # noqa: F401
+                   steam, updater, version, watchdog)
     print("selftest OK")
 
 
@@ -68,6 +71,12 @@ def main():
         sys.exit(0 if remove() else 1)
     elif "--selftest" in args:
         _selftest()
+    elif "--apply-update" in args:
+        from .updater import apply_update
+        sys.exit(apply_update(args[args.index("--apply-update") + 1]))
+    elif "--version" in args:
+        from .version import __version__
+        print(__version__)
     elif "--stop-daemon" in args:
         _stop_daemon()
     elif "--cli" in args:

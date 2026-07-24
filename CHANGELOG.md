@@ -2,6 +2,27 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.7.0] — 2026-07-24
+
+**改了什么**
+- 在线更新：GUI 启动 3 秒后后台静默检查 GitHub Releases（失败不打扰），发现新版弹更新卡片（版本 + 更新说明 + 大小）；标题旁新增版本号显示 + 手动「检查更新」按钮
+- 一键更新链路：下载新 exe 到同目录（进度条）→ 新 exe `--selftest` 自校验防半截文件 → UAC 提权 `--apply-update`：停自愈任务 → 杀旧 exe 全部进程 → 旧 exe 改名 `.old.exe` 留回退 → 新 exe 顶上 → 恢复任务拉起守护 + 新 GUI
+- 兜底：检查失败静默/手动时提示；下载或校验失败给「打开下载页」；「忽略此版本」持久化（数据目录 update_ignore.txt）
+- 新增 `--version`；`run_elevated` 支持提权任意 exe + 参数带空格加引号
+
+**关键改动文件**
+- `gamelimiter/updater.py`（新增）、`gamelimiter/version.py`（新增）、`gamelimiter/gui.py`、`gamelimiter/app.py`、`gamelimiter/winutil.py`
+
+**设计决策**
+- 参考 ClaudeDeck（tauri-updater：查→弹窗→下载→装→重启 + 兜底开下载页），适配单 exe：计划任务 `/TR` 指向 exe 绝对路径 → **原地换文件任务不用重配**；Windows 允许重命名运行中的 exe，新 exe 自己执行换文件（无需额外 updater 程序）
+- 换文件前必须先 DISABLE 自愈任务再杀进程（否则每分钟自愈会在换文件窗口内复活守护占住旧 exe）
+- 更新过程写 `update.log` 到 exe 同目录（提权进程无控制台，排查靠它）；开发环境禁用 apply（sys.executable 是 python）
+
+**验证**
+- 版本比较单测 + 真实 API 双向（0.7.0→None；模拟 0.5.0→发现 v0.6.2 含 asset）
+- GUI web 模式截图：版本号 + 检查按钮渲染正确；更新对话框（说明/按钮/进度条）渲染正确
+- 打包后本机换文件 E2E + 最小 PATH selftest（见 worklog）
+
 ## [v0.6.2] — 2026-07-24
 
 **改了什么**
