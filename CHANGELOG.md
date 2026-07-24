@@ -2,6 +2,19 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.7.3] — 2026-07-25
+
+**改了什么**
+- 修复强制层启用后 GUI 误报「守护未运行（限制不生效）」：SYSTEM 守护创建的全局互斥体默认不给普通用户 SYNCHRONIZE，GUI `OpenMutexW` 吃 ACCESS_DENIED 被当成不存在
+- `mutex_exists` 把 ACCESS_DENIED 判为存在（拒绝访问恰证明对象存在；不存在时报 FILE_NOT_FOUND），与 v0.7.1 的 ACL 坑同族（SYSTEM/用户跨身份可见性）
+
+**关键改动文件**
+- `gamelimiter/winutil.py`（mutex_exists）
+
+**验证**
+- 单测：不存在 → False（FILE_NOT_FOUND 不被误判）；跨进程持有 → True
+- SYSTEM 场景待台式机升级后确认徽标转绿；最小 PATH selftest 通过后发版
+
 ## [v0.7.2] — 2026-07-24
 
 **改了什么**

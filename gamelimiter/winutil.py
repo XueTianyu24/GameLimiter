@@ -10,6 +10,7 @@ WATCHDOG_MUTEX = "Global\\GameLimiterWatchdog"
 
 _SYNCHRONIZE = 0x00100000
 _ERROR_ALREADY_EXISTS = 183
+_ERROR_ACCESS_DENIED = 5
 
 
 def hold_mutex(name: str) -> bool:
@@ -19,11 +20,17 @@ def hold_mutex(name: str) -> bool:
 
 
 def mutex_exists(name: str) -> bool:
+    """探测命名互斥体是否存在（跨身份）。
+
+    SYSTEM 守护创建的全局互斥体，默认安全描述符不给普通用户 SYNCHRONIZE：
+    OpenMutexW 报 ACCESS_DENIED——但拒绝访问恰恰证明对象存在（不存在报
+    FILE_NOT_FOUND），按存在处理，否则 GUI 会把 SYSTEM 守护误判为未运行。
+    """
     h = ctypes.windll.kernel32.OpenMutexW(_SYNCHRONIZE, False, name)
     if h:
         ctypes.windll.kernel32.CloseHandle(h)
         return True
-    return False
+    return ctypes.windll.kernel32.GetLastError() == _ERROR_ACCESS_DENIED
 
 
 def is_frozen() -> bool:
