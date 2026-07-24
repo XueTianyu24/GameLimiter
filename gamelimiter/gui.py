@@ -320,10 +320,15 @@ def open_add_dialog():
                         ui.notify("浏览器模式不支持文件选择，请用其他两种方式", type="warning")
                         return
                     import webview
-                    res = await run.io_bound(
-                        win.create_file_dialog, webview.OPEN_DIALOG,
-                        directory=str(Path.home() / "Desktop"),
-                        file_types=("游戏、快捷方式或 Steam 图标 (*.exe;*.lnk;*.url)",))
+                    try:
+                        # 描述串只能含 \w 和空格（pywebview 过滤器正则），"、/" 等标点会 ValueError
+                        res = await run.io_bound(
+                            win.create_file_dialog, webview.FileDialog.OPEN,
+                            directory=str(Path.home() / "Desktop"),
+                            file_types=("游戏或快捷方式 (*.exe;*.lnk;*.url)",))
+                    except Exception as e:
+                        ui.notify(f"打开文件选择框失败：{e}", type="negative")
+                        return
                     if not res:
                         return
                     picked = res[0]

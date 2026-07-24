@@ -2,6 +2,19 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.6.2] — 2026-07-24
+
+**改了什么**
+- 修复「添加游戏 → 选文件/快捷方式 → 浏览」点击无反应：`file_types` 描述串含"、"（pywebview 过滤器正则只允许 `\w` 和空格）→ `create_file_dialog` 抛 ValueError → windowed exe 无控制台异常不可见
+- 描述串改为"游戏或快捷方式 (*.exe;*.lnk;*.url)"；`webview.OPEN_DIALOG`（已废弃）换 `webview.FileDialog.OPEN`；`pick()` 加异常兜底 `ui.notify`，以后此类错误至少弹通知
+
+**关键改动文件**
+- `gamelimiter/gui.py`（pick 函数）
+
+**验证**
+- `parse_file_type` 新串通过（旧串复现 ValueError；"、/" 均非法、纯中文+空格合法）
+- 最小 PATH `--selftest` 通过后发版
+
 ## [v0.6.1] — 2026-07-24
 
 **改了什么**
