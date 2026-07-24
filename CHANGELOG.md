@@ -2,6 +2,19 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.7.1] — 2026-07-24
+
+**改了什么**
+- 修复台式机守护启动崩溃 `PermissionError: daemon.log`：ProgramData 默认 ACL 下文件只有创建者可写，SYSTEM 守护先建的 `daemon.log` / SQLite `-wal` 把用户身份的进程锁在门外
+- 三层修复：① `setup_system.grant_users_write()` 用 icacls 给数据目录授 Users(SID 直写) 修改权（含已有文件），初始化本机时执行；② SYSTEM 守护每次启动顺手自愈 ACL（已配强制层的机器升级后自动痊愈，无需重新初始化）；③ `daemon.log` 仍写不动时日志退回 LOCALAPPDATA，守护不再崩死（守护崩 = 完全没限制，比日志分裂严重）
+
+**关键改动文件**
+- `gamelimiter/setup_system.py`（grant_users_write）、`gamelimiter/daemon.py`（启动自愈 + 日志兜底）
+
+**验证**
+- 本机实测：grant 后 `icacls` 显示 `Users:(OI)(CI)(M)`；LOG_PATH 指向 System32 复现 PermissionError → 正确退回 LOCALAPPDATA 并告警
+- 三套单测全过；最小 PATH `--selftest` 通过后发版
+
 ## [v0.7.0] — 2026-07-24
 
 **改了什么**

@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import psutil
 
@@ -24,14 +25,24 @@ log = logging.getLogger("gamelimiter")
 
 
 def _setup_logging():
+    """日志进数据目录；无写权限（SYSTEM 先建了 log 的机器上用户身份跑）时
+    退回 LOCALAPPDATA——守护崩死 = 完全没限制，比日志分裂严重得多。"""
+    fallback = None
+    try:
+        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    except PermissionError:
+        alt_dir = Path(os.environ.get("LOCALAPPDATA", ".")) / "GameLimiter"
+        alt_dir.mkdir(parents=True, exist_ok=True)
+        fallback = alt_dir / "daemon.log"
+        fh = logging.FileHandler(fallback, encoding="utf-8")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_PATH, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=[fh, logging.StreamHandler()],
     )
+    if fallback:
+        log.warning("daemon.log 无写权限（SYSTEM 先建所致），本次日志写 %s；"
+                    "SYSTEM 守护启动会自动修复 ACL", fallback)
 
 
 @dataclass
@@ -227,6 +238,8 @@ def main():
     if not hold_mutex(DAEMON_MUTEX):
         log.info("已有守护进程实例在运行，本实例退出")
         return
+    from .setup_system import grant_users_write
+    grant_users_write()   # SYSTEM 身份启动时顺手修数据目录 ACL（自愈已踩坑的机器）
     Daemon().run()
 
 
