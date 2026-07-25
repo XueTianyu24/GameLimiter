@@ -2,6 +2,21 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.9.1] — 2026-07-25
+
+**改了什么**
+- 应用自定义图标：明亮青蓝渐变圆角方块 + 白色游戏手柄（十字键/按钮挖空露底色），替掉 PyInstaller 默认图标。exe / 任务栏 / 托盘（`tray._app_icon` 从 exe 自身提取）一套统一
+- 新增 `scripts/make_icon.py` 程序化生成 `assets/app.ico`：SDF 解析式抗锯齿，8 个尺寸（16-256）各自独立渲染而非缩放大图；16-24px 换加厚造型——细瘦手柄在那个尺寸只剩 2-3 像素高，握把与主体会糊成一团云朵
+- web 模式页签图标用 emoji（native 窗口图标来自 exe 本身；ico 没打进 exe，给路径打包后会失效）
+
+**关键改动文件**
+- 新增 `scripts/make_icon.py` + `assets/app.ico` / `assets/app_preview.png`；`scripts/build_exe.py`（`--icon`）、`gamelimiter/gui.py`（favicon）
+
+**验证**
+- 从打包好的 exe 反向 `extract_icon()` 提取，拿到的就是新图标（64×64）——即托盘实际使用的那条链路
+- 逐尺寸放大目检：24px 起手柄轮廓清晰，16px 中间凹口可辨（该尺寸的物理极限）
+- 最小 PATH selftest 通过
+
 ## [v0.9.0] — 2026-07-25
 
 **改了什么**

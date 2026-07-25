@@ -725,7 +725,9 @@ def main():
         tray.ensure_autostart()     # 幂等，只在打包 exe 下写 HKCU Run
         tray.ensure_running()
     native = os.environ.get("GAMELIMITER_WEB") != "1"
-    ui.run(native=native, title="GameLimiter", window_size=(1180, 800),
+    # favicon 用 emoji：native 窗口图标来自 exe 自身（assets/app.ico），web 模式
+    # 才需要它，而 ico 没打进 exe，给路径反而在打包后失效
+    ui.run(native=native, title="GameLimiter", favicon="🎮", window_size=(1180, 800),
            port=PORT, reload=False, show=not native)
 
 

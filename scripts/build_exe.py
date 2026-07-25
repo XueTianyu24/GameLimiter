@@ -30,6 +30,11 @@ def main():
 
     cmd = ["pyinstaller", "--noconfirm", "--onefile", "--name", name,
            "--add-data", f"{NICEGUI_DATA};nicegui"]
+    icon = ROOT / "assets" / "app.ico"
+    if icon.exists():                       # 应用图标；托盘也从 exe 自身提取它
+        cmd += ["--icon", str(icon)]
+    else:
+        print("警告：assets/app.ico 不存在，先跑 python scripts/make_icon.py")
     if not debug:
         cmd.append("--windowed")
     for loc in sorted(set(need.values())):
