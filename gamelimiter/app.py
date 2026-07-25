@@ -3,6 +3,7 @@
   （无参数）        GUI 仪表盘
   --daemon          守护进程
   --watchdog        watchdog（守护进程自动拉起）
+  --tray            托盘图标（用户身份，GUI 自动拉起并登记开机自启）
   --setup-system    配置强制层（SYSTEM 计划任务，需管理员）
   --remove-system   移除强制层（需管理员）
   --stop-daemon     停止 watchdog + 守护（调试用；SYSTEM 化后需管理员才杀得动）
@@ -25,7 +26,7 @@ def _selftest():
     import psutil  # noqa: F401
     from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
     from . import (changes, cli, daemon, db, gui, icons, rules,  # noqa: F401
-                   setup_system, steam, updater, version, watchdog)
+                   setup_system, stats, steam, tray, updater, version, watchdog)
     print("selftest OK")
 
 
@@ -63,6 +64,9 @@ def main():
     elif "--watchdog" in args:
         from .watchdog import main as m
         m()
+    elif "--tray" in args:
+        from .tray import main as m
+        sys.exit(m())
     elif "--setup-system" in args:
         from .setup_system import setup
         sys.exit(0 if setup() else 1)

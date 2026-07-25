@@ -11,13 +11,14 @@ import os
 import sys
 import time
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime
+from html import escape
 from pathlib import Path
 
 import psutil
 from nicegui import app, run, ui
 
-from . import changes, config, db, icons, rules, setup_system, steam, updater
+from . import changes, config, db, icons, rules, setup_system, stats, steam, updater
 from .version import __version__
 from .winutil import (DAEMON_MUTEX, is_frozen, mutex_exists, run_elevated,
                       spawn_detached)
@@ -409,6 +410,104 @@ def open_add_dialog():
     dlg.open()
 
 
+# ---------------- 游玩统计 ----------------
+
+# 明亮青蓝色阶（与主色 sky-500 同族），level 0-4
+_HEAT_COLORS = ("#eef2f7", "#bae6fd", "#7dd3fc", "#38bdf8", "#0284c7")
+_CELL, _GAP, _LABEL_W = 12, 3, 22       # 格子 / 间距 / 星期标签列宽（px）
+_heat_year: list = []                   # 当前查看年份，闭包外持有便于 refresh
+
+
+def _heat_cell_html(cell) -> str:
+    if cell is None:
+        return f'<div style="width:{_CELL}px;height:{_CELL}px"></div>'
+    txt = f"{cell.day.month}月{cell.day.day}日 · " + (
+        f"{cell.minutes:.0f} 分钟" if cell.minutes else "没玩")
+    return (f'<div title="{escape(txt)}" style="width:{_CELL}px;height:{_CELL}px;'
+            f'border-radius:2px;background:{_HEAT_COLORS[cell.level]}"></div>')
+
+
+def heatmap_html(weeks: list) -> str:
+    """整张热力图一次性出 HTML：365 个独立 NiceGUI 元素太重，且要走 WebSocket 同步。"""
+    n = len(weeks)
+    months = "".join(
+        f'<div style="grid-column:{i + 1};white-space:nowrap">{label}</div>'
+        for i, label in stats.month_starts(weeks))
+    weekdays = "".join(
+        f'<div style="line-height:{_CELL}px">{stats.WEEKDAY_LABELS[i] if i % 2 == 0 else ""}</div>'
+        for i in range(7))
+    cells = "".join(_heat_cell_html(c) for col in weeks for c in col)
+    legend = "".join(f'<div style="width:{_CELL}px;height:{_CELL}px;border-radius:2px;'
+                     f'background:{c}"></div>' for c in _HEAT_COLORS)
+    return f"""
+<div style="overflow-x:auto;padding-bottom:4px">
+  <div style="display:inline-block">
+    <div style="display:grid;grid-template-columns:repeat({n},{_CELL}px);gap:{_GAP}px;
+                margin-left:{_LABEL_W + _GAP}px;font-size:10px;color:#94a3b8;margin-bottom:3px">
+      {months}
+    </div>
+    <div style="display:flex;gap:{_GAP}px">
+      <div style="display:grid;grid-template-rows:repeat(7,{_CELL}px);gap:{_GAP}px;
+                  width:{_LABEL_W}px;font-size:9px;color:#94a3b8;text-align:right">{weekdays}</div>
+      <div style="display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,{_CELL}px);
+                  gap:{_GAP}px">{cells}</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:{_GAP}px;justify-content:flex-end;
+                margin-top:6px;font-size:10px;color:#94a3b8">
+      <span>少</span>{legend}<span>多</span>
+    </div>
+  </div>
+</div>"""
+
+
+def _summary_card(title: str, s, note: str):
+    with ui.column().classes("gap-0.5 px-4 py-3 rounded-xl bg-slate-50 min-w-[190px]"):
+        ui.label(title).classes("text-xs text-slate-400")
+        ui.label(s.hours_text).classes("text-2xl font-bold text-slate-800 leading-tight")
+        ui.label(note).classes("text-xs text-slate-400")
+
+
+@ui.refreshable
+def stats_view():
+    today = date.today()
+    year = _heat_year[0] if _heat_year else today.year
+    week = stats.summary(conn, *stats.week_range(today))
+    month = stats.summary(conn, *stats.month_range(today))
+    with ui.column().classes("w-full gap-3"):
+        with ui.row().classes("gap-3 items-stretch flex-wrap"):
+            _summary_card("本周（周一起）", week,
+                          f"{week.sessions} 次 · 玩了 {week.days_played} 天")
+            _summary_card("本月", month,
+                          f"{month.sessions} 次 · 日均 {month.avg_per_played_day / 60:.1f} 小时"
+                          if month.days_played else f"{month.sessions} 次")
+            if month.by_game:
+                with ui.column().classes("gap-1.5 px-4 py-3 rounded-xl bg-slate-50 grow "
+                                         "min-w-[280px] justify-center"):
+                    ui.label("本月分布").classes("text-xs text-slate-400")
+                    for name, mins in month.by_game[:3]:
+                        pct = mins / month.minutes * 100 if month.minutes else 0
+                        with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+                            ui.label(name).classes(
+                                "text-sm text-slate-600 truncate w-[104px] shrink-0")
+                            # 底槽 + 填充条：百分比相对底槽，不受左右文字宽度干扰
+                            with ui.element("div").classes("h-1.5 rounded-full bg-slate-200 grow"):
+                                ui.element("div").classes("h-1.5 rounded-full bg-sky-400") \
+                                    .style(f"width:{max(pct, 2):.0f}%")
+                            ui.label(f"{mins / 60:.1f}h").classes(
+                                "text-xs text-slate-400 w-[42px] text-right shrink-0")
+
+        year_sum = stats.summary(conn, date(year, 1, 1), date(year, 12, 31))
+        with ui.row().classes("w-full items-center gap-2"):
+            years = stats.played_years(conn)
+            ui.select(years, value=year, on_change=lambda e: (_heat_year.clear(),
+                                                             _heat_year.append(e.value),
+                                                             stats_view.refresh())) \
+                .props("dense borderless").classes("text-sm")
+            ui.label(f"年 · 共 {year_sum.hours_text} · {year_sum.days_played} 天有游玩") \
+                .classes("text-sm text-slate-500 -ml-1")
+        ui.html(heatmap_html(stats.heatmap(conn, year)))
+
+
 # ---------------- 游玩记录 ----------------
 
 
@@ -602,12 +701,29 @@ def main_page():
         games_view()
         ui.timer(1.0, lambda: [u() for u in list(_updaters)])
 
+        with ui.expansion("游玩统计", icon="insights", value=True) \
+                .classes("w-full bg-white rounded-2xl shadow-sm") \
+                .on_value_change(lambda e: stats_view.refresh() if e.value else None):
+            stats_view()
+
         with ui.expansion("游玩记录", icon="history").classes("w-full bg-white rounded-2xl shadow-sm") \
                 .on_value_change(lambda e: history_view.refresh() if e.value else None):
             history_view()
 
 
 def main():
+    import multiprocessing
+
+    from . import tray
+    from .winutil import hold_mutex
+    # native 模式下 NiceGUI 会 spawn 一个子进程跑 webview，子进程重新导入模块并
+    # 再次执行 main()——单实例检查若不挡在主进程内，会把自己的窗口进程掐死
+    if multiprocessing.current_process().name == "MainProcess":
+        if not hold_mutex(tray.GUI_MUTEX):
+            print("GameLimiter 面板已在运行")
+            return
+        tray.ensure_autostart()     # 幂等，只在打包 exe 下写 HKCU Run
+        tray.ensure_running()
     native = os.environ.get("GAMELIMITER_WEB") != "1"
     ui.run(native=native, title="GameLimiter", window_size=(1180, 800),
            port=PORT, reload=False, show=not native)
