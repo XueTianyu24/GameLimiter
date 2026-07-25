@@ -26,9 +26,10 @@ def _fmt_ts(ts):
 
 
 def cmd_add(conn, a):
+    from . import icons
     g = db.upsert_game(conn, a.name, a.exe, exe_path=a.path,
                        cooldown_hours=a.cooldown, session_minutes=a.session,
-                       windows=a.windows or None)
+                       windows=a.windows or None, icon=icons.extract_icon(a.path))
     print(f"已添加/更新 [{g.id}] {g.name} ({g.exe_name})")
 
 

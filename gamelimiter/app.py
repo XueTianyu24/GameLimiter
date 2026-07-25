@@ -24,8 +24,8 @@ def _selftest():
     import sqlite3  # noqa: F401
     import psutil  # noqa: F401
     from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
-    from . import (changes, cli, daemon, db, gui, rules, setup_system,  # noqa: F401
-                   steam, updater, version, watchdog)
+    from . import (changes, cli, daemon, db, gui, icons, rules,  # noqa: F401
+                   setup_system, steam, updater, version, watchdog)
     print("selftest OK")
 
 

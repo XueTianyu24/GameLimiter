@@ -2,6 +2,23 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.8.0] — 2026-07-25
+
+**改了什么**
+- 游戏卡片显示真实图标：添加游戏时从 exe 提取图标存 `games.icon`（PNG data URI），卡片改「图标 + 名称 / exe 名」两行版式，取不到图标退回首字母色块
+- 老数据自动补：`db._migrate()` 给老库 ALTER 出 icon 列，GUI 每次渲染对缺图标且有 exe_path 的游戏补提取一次（CLI 加的、v0.8.0 前就存在的都能补上）
+- 新模块 `icons.py`：`PrivateExtractIcons`(64×64，比 `ExtractIconEx` 的 32×32 在高分屏清晰) → `GetIconInfo`/`GetDIBits` 取 BGRA → zlib 手写 PNG 编码。**不引入 Pillow**：图标才几 KB，为它让 onefile exe 涨 4MB 不划算（在线更新是全量下载）
+- 图标进 DB 不落地成文件：绕开 ProgramData 的 ACL 坑（v0.7.1）和 NiceGUI 静态目录配置
+
+**关键改动文件**
+- 新增 `gamelimiter/icons.py` + `tests/test_icons.py`；`gamelimiter/db.py`（icon 列 + `_migrate` + `set_icon`）、`gamelimiter/gui.py`（`game_avatar` / `backfill_icons` / 卡片版式）、`gamelimiter/cli.py`（add 时提取）
+
+**验证**
+- `tests/test_icons.py`：PNG 逐块 CRC/IHDR/扫描行校验 + 像素往返一致；真实 exe 提取到非全透明图标；坏输入（None/空/不存在/目录/非 exe）全返回 None 不抛异常
+- GUI 截图三态齐活：提取成功（记事本）、backfill 补上（资源管理器进来时 icon 为 NULL）、无 exe_path 退回首字母块
+- 迁移幂等：老 schema 库 connect 后长出 icon 列，二次 connect 不报错
+- 四个测试文件全过；最小 PATH selftest 通过后发版
+
 ## [v0.7.4] — 2026-07-25
 
 **改了什么**

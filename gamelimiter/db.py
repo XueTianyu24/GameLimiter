@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS games (
     cooldown_hours REAL,      -- 规则a 间隔冷却，NULL=未启用
     session_minutes REAL,     -- 规则b 单次时长，NULL=未启用
     windows TEXT,             -- 规则c 允许时段，JSON 数组 ["19:00-23:00"]，NULL=不限
+    icon TEXT,                -- 从 exe 提取的 PNG data URI，NULL=没取到（GUI 退回首字母块）
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -61,6 +62,21 @@ class Game:
     session_minutes: Optional[float]
     windows: Optional[list]   # ["19:00-23:00", ...]
     enabled: bool
+    icon: Optional[str] = None
+
+
+# 老库补列：(表, 列, 类型)。ALTER 幂等靠 duplicate column 异常兜底——守护与 GUI
+# 可能同时开库，先查 table_info 再 ALTER 仍有竞态窗口
+_MIGRATIONS = [("games", "icon", "TEXT")]
+
+
+def _migrate(conn):
+    for table, col, type_ in _MIGRATIONS:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
 
 
 def connect() -> sqlite3.Connection:
@@ -69,6 +85,7 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -77,7 +94,7 @@ def _row_to_game(r: sqlite3.Row) -> Game:
         id=r["id"], name=r["name"], exe_name=r["exe_name"], exe_path=r["exe_path"],
         cooldown_hours=r["cooldown_hours"], session_minutes=r["session_minutes"],
         windows=json.loads(r["windows"]) if r["windows"] else None,
-        enabled=bool(r["enabled"]),
+        enabled=bool(r["enabled"]), icon=r["icon"],
     )
 
 
@@ -92,21 +109,29 @@ def get_game(conn, exe_name: str) -> Optional[Game]:
 
 
 def upsert_game(conn, name, exe_name, exe_path=None,
-                cooldown_hours=None, session_minutes=None, windows=None) -> Game:
+                cooldown_hours=None, session_minutes=None, windows=None, icon=None) -> Game:
     now = int(time.time())
     conn.execute(
         """INSERT INTO games (name, exe_name, exe_path, cooldown_hours, session_minutes, windows,
-                              created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?)
+                              icon, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(exe_name) DO UPDATE SET
              name=excluded.name, exe_path=excluded.exe_path,
              cooldown_hours=excluded.cooldown_hours,
              session_minutes=excluded.session_minutes,
-             windows=excluded.windows, updated_at=excluded.updated_at""",
+             windows=excluded.windows,
+             icon=COALESCE(excluded.icon, games.icon),   -- 没带图标时不清掉已有的
+             updated_at=excluded.updated_at""",
         (name, exe_name, exe_path, cooldown_hours, session_minutes,
-         json.dumps(windows) if windows else None, now, now))
+         json.dumps(windows) if windows else None, icon, now, now))
     conn.commit()
     return get_game(conn, exe_name)
+
+
+def set_icon(conn, game_id: int, icon: Optional[str]):
+    """只改图标，不动 updated_at（补图标不算规则变更）。"""
+    conn.execute("UPDATE games SET icon=? WHERE id=?", (icon, game_id))
+    conn.commit()
 
 
 def update_rules(conn, game_id: int, **fields):

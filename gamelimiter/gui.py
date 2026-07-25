@@ -17,7 +17,7 @@ from pathlib import Path
 import psutil
 from nicegui import app, run, ui
 
-from . import changes, config, db, rules, setup_system, steam, updater
+from . import changes, config, db, icons, rules, setup_system, steam, updater
 from .version import __version__
 from .winutil import (DAEMON_MUTEX, is_frozen, mutex_exists, run_elevated,
                       spawn_detached)
@@ -100,11 +100,30 @@ def resolve_lnk(path: str) -> str:
 _updaters: list = []   # 每秒刷新的闭包（只改状态文字，不重建输入框）
 
 
+def game_avatar(g: db.Game):
+    """游戏图标；没提取到就退回首字母色块（名称首字，中文名直接显示该字）。"""
+    box = "w-9 h-9 rounded-lg shrink-0"
+    if g.icon:
+        # 原生 <img> 而非 ui.image：后者是 Quasar q-img，走 CSS background-image，
+        # 长 data URI 塞进 url() 渲染不出来（实测空白框）
+        ui.html(f'<img src="{g.icon}" alt="" '
+                f'style="width:36px;height:36px;object-fit:contain;border-radius:8px">') \
+            .classes("shrink-0 leading-none")
+    else:
+        ui.label(g.name[:1].upper()).classes(
+            f"{box} bg-sky-100 text-sky-600 font-bold flex items-center justify-center")
+
+
 def game_card(g: db.Game):
     with ui.card().classes("w-[340px] rounded-2xl shadow-md p-4 gap-2 bg-white"):
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label(g.name).classes("text-lg font-bold text-slate-800")
-            with ui.row().classes("items-center gap-1"):
+        with ui.row().classes("w-full items-center justify-between flex-nowrap"):
+            with ui.row().classes("items-center gap-2.5 min-w-0 flex-nowrap"):
+                game_avatar(g)
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(g.name).classes(
+                        "text-lg font-bold text-slate-800 leading-tight truncate")
+                    ui.label(g.exe_name).classes("text-xs text-slate-400 leading-tight truncate")
+            with ui.row().classes("items-center gap-1 flex-nowrap"):
                 sw = ui.switch(value=g.enabled)
                 sw.props("dense color=green").tooltip("启用/停用限制")
 
@@ -138,7 +157,6 @@ def game_card(g: db.Game):
                 ui.button(icon="delete_outline", on_click=confirm_delete) \
                     .props("flat dense round color=grey")
 
-        ui.label(g.exe_name).classes("text-xs text-slate-400 -mt-2")
         chip = ui.label().classes("px-3 py-1 rounded-full text-sm font-medium")
         sub = ui.label().classes("text-xs text-slate-400")
 
@@ -232,10 +250,29 @@ def game_card(g: db.Game):
                         ui.button("取消", on_click=cancel).props("flat dense size=sm color=grey")
 
 
+def backfill_icons(games: list[db.Game]) -> bool:
+    """给缺图标的游戏补提取（CLI 添加的、或 v0.8.0 之前就存在的）。返回是否有更新。
+
+    只在 exe_path 存在时尝试；取不到就保持 NULL（卡片退回首字母块），下次打开
+    再试一次——路径可能是临时失效（游戏盘没挂载等）。
+    """
+    changed = False
+    for g in games:
+        if g.icon or not g.exe_path:
+            continue
+        uri = icons.extract_icon(g.exe_path)
+        if uri:
+            db.set_icon(conn, g.id, uri)
+            g.icon = uri
+            changed = True
+    return changed
+
+
 @ui.refreshable
 def games_view():
     _updaters.clear()
     games = db.list_games(conn)
+    backfill_icons(games)
     if not games:
         with ui.column().classes("w-full items-center py-16 gap-2"):
             ui.icon("sports_esports").classes("text-6xl text-slate-300")
@@ -255,7 +292,8 @@ def add_game(name: str, exe_name: str, exe_path: str = None):
     if not exe_name.lower().endswith(".exe"):
         ui.notify("进程名需以 .exe 结尾", type="warning")
         return False
-    db.upsert_game(conn, name, exe_name, exe_path=exe_path)
+    db.upsert_game(conn, name, exe_name, exe_path=exe_path,
+                   icon=icons.extract_icon(exe_path))
     ui.notify(f"已添加 {name}，在卡片上配置规则", type="positive")
     games_view.refresh()
     return True

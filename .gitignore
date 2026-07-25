@@ -11,3 +11,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# 本地调试产物（截图 / GUI 日志）
+.tmp/
