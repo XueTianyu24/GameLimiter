@@ -538,12 +538,20 @@ def main_page():
             ui.button("添加游戏", icon="add", on_click=open_add_dialog).props("rounded color=sky-500")
 
         def upd_badge():
-            ok = daemon_running()
+            # 探测两条都不许抛：任一异常都会中断刷新，徽标停在旧值/空白，
+            # 「初始化本机」按钮跟着常驻，看起来与真的未配置一模一样
+            try:
+                ok = daemon_running()
+            except Exception:                       # noqa: BLE001
+                ok = False
             badge.text = "守护运行中" if ok else "守护未运行（限制不生效）"
             badge.classes(replace="px-2 py-0.5 rounded-full text-xs font-medium " +
                           ("bg-green-100 text-green-700" if ok else "bg-red-100 text-red-600"))
             start_btn.visible = not ok
-            cfg = setup_system.is_configured()
+            try:
+                cfg = setup_system.is_configured()
+            except Exception:                       # noqa: BLE001
+                cfg = False
             sys_badge.text = "强制层已启用" if cfg else "强制层未配置"
             sys_badge.classes(replace="px-2 py-0.5 rounded-full text-xs font-medium " +
                               ("bg-green-100 text-green-700" if cfg else "bg-amber-100 text-amber-700"))

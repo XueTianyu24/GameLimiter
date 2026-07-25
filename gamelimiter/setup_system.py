@@ -7,6 +7,7 @@
 用法（管理员）：GameLimiter.exe --setup-system / --remove-system
 """
 
+import os
 import subprocess
 import sys
 import winreg
@@ -15,6 +16,11 @@ from .winutil import is_frozen, project_root
 
 TASK_DAEMON = "GameLimiter-Daemon"
 TASK_HEAL = "GameLimiter-Heal"
+
+# 绝对路径调用：进程环境的 PATH 未必含 System32（计划任务/提权上下文继承来的
+# 环境可能被裁剪），靠 PATH 找 schtasks 会抛 FileNotFoundError
+SCHTASKS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                        "System32", "schtasks.exe")
 
 
 def _daemon_tr() -> str:
@@ -27,12 +33,29 @@ def _daemon_tr() -> str:
 
 
 def _schtasks(*args) -> subprocess.CompletedProcess:
-    return subprocess.run(["schtasks", *args], capture_output=True, text=True,
-                          creationflags=subprocess.CREATE_NO_WINDOW)
+    return subprocess.run([SCHTASKS, *args], capture_output=True, text=True,
+                          errors="ignore", creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+_DENIED_MARKS = ("拒绝访问", "denied")   # 中英文系统各一
 
 
 def is_configured() -> bool:
-    return _schtasks("/Query", "/TN", TASK_DAEMON).returncode == 0
+    """强制层是否已配置（SYSTEM 守护任务是否存在）。
+
+    普通权限查询 SYSTEM 建的任务会被 ACL 挡回「错误: 拒绝访问。」——同
+    winutil.mutex_exists，拒绝访问恰恰证明任务存在（不存在报「系统找不到指定
+    的文件」），按已配置处理。否则台式机重启后 GUI 会把跑得好好的强制层报成
+    未配置、诱导重复初始化（v0.7.4 实测踩坑）。
+    """
+    try:
+        r = _schtasks("/Query", "/TN", TASK_DAEMON)
+    except OSError:      # schtasks 都调不起来，无从判定
+        return False
+    if r.returncode == 0:
+        return True
+    out = ((r.stderr or "") + (r.stdout or "")).lower()
+    return any(m in out for m in _DENIED_MARKS)
 
 
 USERS_SID = "*S-1-5-32-545"   # BUILTIN\Users 的 SID 直写，不受系统语言影响

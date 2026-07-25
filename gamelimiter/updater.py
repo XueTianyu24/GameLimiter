@@ -97,8 +97,9 @@ def _log(f, msg: str):
 
 
 def _schtasks(*args):
-    return subprocess.run(["schtasks", *args], capture_output=True, text=True,
-                          creationflags=_NOWIN)
+    from .setup_system import SCHTASKS
+    return subprocess.run([SCHTASKS, *args], capture_output=True, text=True,
+                          errors="ignore", creationflags=_NOWIN)
 
 
 def apply_update(target_str: str) -> int:
@@ -143,7 +144,8 @@ def apply_update(target_str: str) -> int:
             me.rename(target)
             _log(log, "swapped OK")
             # 4 恢复任务并拉起守护；未配置强制层则直接起守护进程
-            configured = _schtasks("/Query", "/TN", TASK_DAEMON).returncode == 0
+            from .setup_system import is_configured
+            configured = is_configured()
             if configured:
                 for tn in (TASK_DAEMON, TASK_HEAL):
                     _schtasks("/Change", "/TN", tn, "/ENABLE")

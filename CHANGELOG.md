@@ -2,6 +2,21 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.7.4] — 2026-07-25
+
+**改了什么**
+- 修复台式机重启后 GUI 误报「强制层未配置」+ 常驻「初始化本机」按钮：`is_configured()` 只看 `schtasks /Query` 返回码，而普通权限查 SYSTEM 建的任务被 ACL 挡回「错误: 拒绝访问。」（rc=1）→ 判成任务不存在。与 v0.7.3 的互斥体误报同族：拒绝访问恰证明存在，只有「系统找不到指定的文件」才是真没配
+- schtasks 改绝对路径 `%SystemRoot%\System32\schtasks.exe` 调用并兜 OSError：靠 PATH 找、且这行原本无 try/except，一旦 FileNotFoundError 会静默打断整个徽标刷新，表现与"未配置"无法区分
+- `upd_badge()` 两条探测各加异常兜底；`updater.apply_update` 的换 exe 后任务恢复判定改用同一个 `is_configured()`
+
+**关键改动文件**
+- `gamelimiter/setup_system.py`（SCHTASKS 常量 + is_configured 三态判定）、`gamelimiter/gui.py`（upd_badge）、`gamelimiter/updater.py`（_schtasks / configured）
+
+**验证**
+- 分支单测：rc=0 / 中文「拒绝访问」/ 英文「Access is denied」→ True；「系统找不到指定的文件」→ False；本机（任务确不存在）→ False
+- 台式机现场取证：`schtasks /Query /TN GameLimiter-Daemon` 普通权限报拒绝访问 rc=1，管理员查得到「计划任务状态: 已启用」→ 确认误报而非强制层丢失
+- `tests/test_rules.py` / `tests/test_changes.py` 全过；最小 PATH selftest 通过后发版
+
 ## [v0.7.3] — 2026-07-25
 
 **改了什么**
