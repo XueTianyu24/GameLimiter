@@ -107,6 +107,7 @@ class Daemon:
     def __init__(self):
         self.conn = db.connect()
         self.games: list[db.Game] = []
+        self.daily_limit: Optional[int] = None       # 全局规则 d，随 reload_games 刷新
         self.active: dict[int, ActiveSession] = {}   # game_id -> ActiveSession
         self.wake = threading.Event()
         self._last_reload = 0.0
@@ -116,6 +117,7 @@ class Daemon:
 
     def reload_games(self):
         self.games = db.list_games(self.conn, enabled_only=True)
+        self.daily_limit = db.get_daily_game_limit(self.conn)
         self._last_reload = time.time()
 
     def exe_names(self) -> set[str]:
@@ -139,7 +141,11 @@ class Daemon:
     # ---- 每轮处理 ----
 
     def _handle_start_attempt(self, g: db.Game, procs: list[psutil.Process], now: float):
-        verdict = rules.check_start(g, db.last_session_end(self.conn, g.id), now)
+        # 全局款数上限先判：它挡的是"今天又开一款新的"，比冷却/时段更能说明问题
+        today = db.games_played_between(self.conn, *rules.day_bounds(now))
+        verdict = rules.check_daily_limit(self.daily_limit, today, g.id, now)
+        if verdict.allowed:
+            verdict = rules.check_start(g, db.last_session_end(self.conn, g.id), now)
         if not verdict.allowed:
             n = _kill(procs)
             db.log_event(self.conn, g.id, "blocked", f"{verdict.reason}: {verdict.detail}")

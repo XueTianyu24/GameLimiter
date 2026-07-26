@@ -10,8 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gamelimiter.db import Game
-from gamelimiter.rules import (check_start, current_window_end, effective_limit,
-                               next_window_start, session_deadline)
+from gamelimiter.rules import (check_daily_limit, check_start, current_window_end, day_bounds,
+                               effective_limit, next_window_start, session_deadline)
 
 
 def g(cooldown=None, session=None, windows=None):
@@ -87,5 +87,20 @@ assert dl == (ts("2026-07-23 19:30"), "window_end"), dl
 # 上限不限、只给额度
 dl = session_deadline(g(), start, ts("2026-07-23 19:10"), 45)
 assert dl == (ts("2026-07-23 19:45"), "session_timeout"), dl
+
+# 全局规则 d：每天最多玩几款
+now = ts("2026-07-26 21:00")
+assert day_bounds(now) == (ts("2026-07-26 00:00"), ts("2026-07-27 00:00"))
+two = {1: "永劫无间", 2: "帕鲁"}
+assert check_daily_limit(None, two, 3, now).allowed            # 未设 = 不限
+assert check_daily_limit(3, two, 3, now).allowed               # 还没到上限
+assert check_daily_limit(2, two, 1, now).allowed               # 今天玩过的那款照常开
+v = check_daily_limit(2, two, 3, now)                          # 新游戏 → 拦
+assert not v.allowed and v.reason == "daily_game_limit", v
+assert v.unlock_ts == ts("2026-07-27 00:00") and "永劫无间、帕鲁" in v.detail, v.detail
+# 收紧到比今天已玩款数还小：已玩过的不追溯锁死，只挡新的
+assert check_daily_limit(1, two, 2, now).allowed
+assert not check_daily_limit(1, two, 3, now).allowed
+assert check_daily_limit(2, {}, 1, now).allowed                # 今天还没玩
 
 print("test_rules: 全部通过")

@@ -219,6 +219,7 @@ def game_card(g: db.Game):
             if in_sess != seen["in"]:
                 seen["in"] = in_sess                # 会话开/关 → 额度框的值与语义都变了
                 games_view.refresh()
+                global_rule_view.refresh()          # 今日已玩款数也跟着变
         upd()
         _updaters.append(upd)
 
@@ -320,6 +321,54 @@ def backfill_icons(games: list[db.Game]) -> bool:
 
 
 @ui.refreshable
+def global_rule_view():
+    """全局规则 d：每天最多玩几款游戏（不挂在单个游戏卡片上）。"""
+    if not db.list_games(conn):
+        return
+    limit = db.get_daily_game_limit(conn)
+    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
+    with ui.card().classes("w-full rounded-2xl shadow-sm p-3 gap-1 bg-white"):
+        with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+            ui.icon("today").classes("text-xl text-sky-500")
+            ui.label("每天最多玩").classes("text-sm text-slate-600 shrink-0")
+            n = ui.number(value=limit, min=0, step=1, placeholder="不限") \
+                .classes("w-[64px]").props("dense") \
+                .tooltip("一天内最多能开几款不同的游戏；空 = 不限。调小立即生效，调大延迟 24 小时")
+            ui.label("款游戏").classes("text-sm text-slate-600 shrink-0")
+            if today:
+                hit = limit and len(today) >= limit
+                ui.label(f"· 今天已玩 {len(today)} 款：{'、'.join(today.values())}"
+                         + ("（已用满，新游戏今天打不开）" if hit else "")) \
+                    .classes("text-xs " + ("text-amber-600" if hit else "text-slate-400"))
+            else:
+                ui.label("· 今天还没玩").classes("text-xs text-slate-400")
+            ui.space()
+            ui.button("不限", on_click=lambda: (n.set_value(None), save_limit())) \
+                .props("flat dense size=sm color=grey")
+
+        def save_limit(n=n):
+            status, _, msg = changes.request_daily_limit(conn, n.value)
+            if status == "nochange":
+                return
+            ui.notify(msg, type="positive" if status == "applied" else "warning")
+            global_rule_view.refresh()
+            games_view.refresh()
+        n.on("blur", save_limit)
+        n.on("keydown.enter", save_limit)
+
+        for p in changes.global_pendings(conn):
+            with ui.row().classes("w-full items-center gap-1"):
+                ui.icon("hourglass_top").classes("text-amber-500 text-sm")
+                ui.label(changes.describe_pending(p)).classes("text-xs text-amber-600 flex-grow")
+
+                def cancel(pid=p["id"]):
+                    changes.cancel_pending(conn, pid)
+                    ui.notify("已取消该放宽申请", type="positive")
+                    global_rule_view.refresh()
+                ui.button("取消", on_click=cancel).props("flat dense size=sm color=grey")
+
+
+@ui.refreshable
 def games_view():
     _updaters.clear()
     games = db.list_games(conn)
@@ -347,6 +396,7 @@ def add_game(name: str, exe_name: str, exe_path: str = None):
                    icon=icons.extract_icon(exe_path))
     ui.notify(f"已添加 {name}，在卡片上配置规则", type="positive")
     games_view.refresh()
+    global_rule_view.refresh()      # 第一款游戏加进来时这条全局规则才出现
     return True
 
 
@@ -750,6 +800,7 @@ def main_page():
         upd_badge()
         ui.timer(5.0, upd_badge)
 
+        global_rule_view()
         games_view()
         ui.timer(1.0, lambda: [u() for u in list(_updaters)])
 

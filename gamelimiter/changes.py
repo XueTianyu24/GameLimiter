@@ -10,16 +10,20 @@ from typing import Optional
 from . import config, db, rules
 
 FIELD_ZH = {"cooldown_hours": "间隔冷却", "session_minutes": "单次最长时长",
-            "windows": "允许时段", "enabled": "启用状态", "__delete__": "删除游戏"}
+            "windows": "允许时段", "enabled": "启用状态", "__delete__": "删除游戏",
+            "daily_game_limit": "每天最多玩几款"}
+
+# 全局设置在 pending_changes 里借 game_id=0 落座（games.id 从 1 起，不会撞）
+GLOBAL_GAME_ID = 0
 
 
 def is_tightening(field: str, old, new) -> bool:
     """new 相对 old 是否为收紧（含不变）。收紧立即生效，放宽入待生效队列。"""
     if field == "cooldown_hours":
         return (new or 0) >= (old or 0)                    # 冷却更长 = 更严
-    if field == "session_minutes":
+    if field in ("session_minutes", "daily_game_limit"):
         inf = float("inf")
-        return (new or inf) <= (old or inf)                # 单次更短 = 更严；None = 不限
+        return (new or inf) <= (old or inf)                # 更短/更少 = 更严；None = 不限
     if field == "windows":
         return rules.coverage(new) <= rules.coverage(old)  # 可玩时间是子集 = 更严
     if field == "enabled":
@@ -63,6 +67,36 @@ def request_delete(conn, g: db.Game) -> Optional[int]:
     apply_at = int(time.time() + config.RELAX_DELAY_HOURS * 3600)
     db.upsert_pending(conn, g.id, "__delete__", None, apply_at)
     return apply_at
+
+
+# ---- 全局规则 d：每天最多玩几款游戏 ----
+
+def request_daily_limit(conn, new) -> tuple[str, Optional[int], str]:
+    """申请改「每天最多玩几款」。返回 (状态, apply_at, 中文说明)。
+
+    状态 nochange / applied（收紧，立即）/ delayed（放宽，24h 后）——与单游戏规则同一套纪律。
+    """
+    old = db.get_daily_game_limit(conn)
+    new = int(new) if new else None
+    if new is not None and new < 1:
+        new = None
+    if new == old:
+        return "nochange", None, ""
+    if is_tightening("daily_game_limit", old, new):
+        db.set_daily_game_limit(conn, new)
+        db.clear_pending_field(conn, GLOBAL_GAME_ID, "daily_game_limit")
+        return "applied", None, (f"已生效：每天最多玩 {new} 款游戏" if new
+                                 else "已取消每天款数限制")
+    apply_at = int(time.time() + config.RELAX_DELAY_HOURS * 3600)
+    db.upsert_pending(conn, GLOBAL_GAME_ID, "daily_game_limit", new, apply_at)
+    from datetime import datetime
+    t = datetime.fromtimestamp(apply_at).strftime("%m-%d %H:%M")
+    desc = f"放宽到每天 {new} 款" if new else "取消款数限制"
+    return "delayed", apply_at, f"{desc}属于放宽，{t} 生效（期间可随时取消）"
+
+
+def global_pendings(conn) -> list:
+    return db.list_pending(conn, GLOBAL_GAME_ID)
 
 
 # ---- 本次游玩额度（规则 b 的一次性收紧）----
@@ -121,7 +155,10 @@ def apply_due(conn, now: float) -> int:
     """把到期的待生效变更落地（守护进程周期调用）。返回应用条数。"""
     n = 0
     for p in db.due_pendings(conn, now):
-        if p["field"] == "__delete__":
+        if p["game_id"] == GLOBAL_GAME_ID:
+            db.set_daily_game_limit(conn, json.loads(p["value"])["v"])
+            db.delete_pending(conn, p["id"])
+        elif p["field"] == "__delete__":
             db.remove_game(conn, p["game_id"])
         else:
             v = json.loads(p["value"])["v"]
@@ -138,6 +175,9 @@ def describe_pending(p) -> str:
     if p["field"] == "__delete__":
         return f"解除全部限制并删除，{t} 生效"
     v = json.loads(p["value"])["v"]
+    if p["game_id"] == GLOBAL_GAME_ID:
+        return (f"每天最多玩 {v} 款游戏，{t} 生效" if v
+                else f"取消「每天最多玩几款」限制，{t} 生效")
     if p["field"] == "enabled":
         desc = "停用限制"
     elif p["field"] == "windows":

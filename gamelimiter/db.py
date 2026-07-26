@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,       -- blocked / killed / warn / daemon_start ...
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,     -- 全局设置（跨游戏），目前只有 daily_game_limit
+    value TEXT                -- NULL = 未设/不限
+);
 CREATE TABLE IF NOT EXISTS pending_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     game_id INTEGER NOT NULL,
@@ -204,6 +208,48 @@ def active_session(conn, game_id: int) -> Optional[sqlite3.Row]:
 def last_session_end(conn, game_id: int) -> Optional[int]:
     r = conn.execute("SELECT MAX(end_ts) AS m FROM sessions WHERE game_id=?", (game_id,)).fetchone()
     return r["m"]
+
+
+# ---- 全局设置 ----
+
+DAILY_GAME_LIMIT = "daily_game_limit"
+
+
+def get_setting(conn, key: str) -> Optional[str]:
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else None
+
+
+def set_setting(conn, key: str, value):
+    conn.execute("""INSERT INTO settings (key, value) VALUES (?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                 (key, None if value is None else str(value)))
+    conn.commit()
+
+
+def get_daily_game_limit(conn) -> Optional[int]:
+    """一天内最多能玩几款不同的游戏；None = 不限。"""
+    v = get_setting(conn, DAILY_GAME_LIMIT)
+    return int(v) if v else None
+
+
+def set_daily_game_limit(conn, n: Optional[int]):
+    set_setting(conn, DAILY_GAME_LIMIT, int(n) if n else None)
+
+
+def games_played_between(conn, start_ts: float, end_ts: float,
+                         now_ts: Optional[float] = None) -> dict[int, str]:
+    """与 [start, end) 有交集的会话涉及的游戏 {id: 名称}。
+
+    跨午夜的会话两头都算——凌晨 1 点还在玩，那它就占今天一个名额。
+    进行中的会话（end_ts 为 NULL）按"到此刻为止"算，否则查未来区间时它会一直命中。
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    rows = conn.execute(
+        """SELECT DISTINCT s.game_id, g.name FROM sessions s JOIN games g ON g.id=s.game_id
+           WHERE s.start_ts < ? AND COALESCE(s.end_ts, ?) > ?""",
+        (int(end_ts), int(now_ts), int(start_ts)))
+    return {r["game_id"]: r["name"] for r in rows}
 
 
 # ---- 待生效变更（规则放宽延迟）----

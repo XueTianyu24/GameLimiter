@@ -3,7 +3,8 @@
 (a) cooldown_hours   间隔冷却：now >= 上次会话结束 + N 小时 才允许启动
 (b) session_minutes  单次最长时长（上限）：deadline = 会话开始 + N 分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
-三规则可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
+(d) daily_game_limit **全局**：一天内最多玩几款不同的游戏（不挂在单个游戏上）
+a/b/c 三条按游戏配置、可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
 
 规则 b 是**上限**：每次会话可另给一个"本次额度"（`limit_minutes`），与上限取更严者。
 额度只能收紧不能放宽——这是防冲动的核心，见 `changes.set_next_session`。
@@ -56,6 +57,28 @@ def current_window_end(windows: list[str], now: datetime) -> Optional[datetime]:
 def next_window_start(windows: list[str], now: datetime) -> Optional[datetime]:
     starts = [st for st, _ in _concrete_intervals(windows, now) if st > now]
     return min(starts) if starts else None
+
+
+def day_bounds(now_ts: float) -> tuple[float, float]:
+    """now 所在自然日的 [0:00, 次日 0:00)。"""
+    d = datetime.fromtimestamp(now_ts).replace(hour=0, minute=0, second=0, microsecond=0)
+    return d.timestamp(), (d + timedelta(days=1)).timestamp()
+
+
+def check_daily_limit(limit: Optional[int], today: dict, game_id: int,
+                      now_ts: float) -> StartVerdict:
+    """全局规则 (d)：一天内最多玩几款**不同**的游戏。
+
+    `today` = {game_id: 名称}，今天已开过的那几款。已在名单里的不受限（继续玩自己的），
+    只挡今天还没碰过的新游戏——否则收紧数值会把当天已经在玩的也一起锁死。
+    """
+    if not limit or game_id in today or len(today) < limit:
+        return StartVerdict(True)
+    _, tomorrow = day_bounds(now_ts)
+    names = "、".join(today.values())
+    return StartVerdict(False, "daily_game_limit",
+                        f"今天已经玩过 {len(today)} 款（{names}），达到每天最多 {limit} 款的上限；"
+                        f"这款今天还没玩过，明天 0:00 后可以开", tomorrow)
 
 
 def check_start(game: Game, last_end_ts: Optional[int], now_ts: float) -> StartVerdict:

@@ -2,6 +2,26 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.11.0] — 2026-07-26
+
+**改了什么**
+- 新增**全局规则 (d)「每天最多玩几款游戏」**——前三条都是按游戏配的，这是第一条跨游戏的总量规则
+  - 语义：一天内最多开几款**不同**的游戏，自然日 0:00 起算。**今天已经玩过的那几款不受影响**（继续玩自己的），只挡今天还没碰过的新游戏——否则把数值调小会连当天正在玩的一起锁死
+  - 跨午夜的会话两头都算（凌晨 1 点还在玩，就占今天一个名额），与统计口径一致；进行中会话按"到此刻为止"算，否则查未来区间会一直命中
+  - 判定放在冷却/时段之前：挡的是"今天又开一款新的"，这个理由比冷却更能说明问题
+  - **改这条同样受冷静期管制**：调小 / 从不限改成 N = 收紧，立即生效；调大 / 取消 = 放宽，24 小时后生效，期间可随时取消
+- 存储加 `settings` 表（key-value 全局设置）；全局项在 `pending_changes` 里借 `game_id=0` 落座（`games.id` 从 1 起，不会撞），`apply_due` / `describe_pending` 分流处理
+- GUI 顶部新增全局规则条：「每天最多玩 [N] 款游戏 · 今天已玩 X 款：A、B」，用满时转琥珀色提示"新游戏今天打不开"，待生效放宽就地显示可取消
+- CLI 加 `daily [N|off]`（留空查看，含待生效项）；`list` 顶部显示全局限制与今日已玩；`pending` 里全局项显示为「全局」
+
+**关键改动文件**
+- `gamelimiter/rules.py`（`day_bounds` + `check_daily_limit`）、`gamelimiter/db.py`（`settings` 表 + `get/set_daily_game_limit` + `games_played_between`）、`gamelimiter/changes.py`（`GLOBAL_GAME_ID` + `request_daily_limit` + 全局分流）、`gamelimiter/daemon.py`（启动前置判定）、`gamelimiter/gui.py`（`global_rule_view`）、`gamelimiter/cli.py`、`tests/test_rules.py` + `tests/test_changes.py`
+
+**验证**
+- 五个测试文件全过；新增覆盖：已玩过的那款照常放行、新游戏被拦、上限收紧到小于今日已玩数不追溯锁死、`unlock_ts` 为次日 0:00、收紧即时 / 放宽入队 / 到期落地 / 改主意变严撤销申请、跨午夜会话两天都算而未来区间不命中
+- 端到端（隔离库）：上限 1 款 → 记事本放行、画图被拦且进程被杀（events 记 `daily_game_limit`）、记事本二次启动照常放行
+- GUI 截图：全局条显示「每天最多玩 2 款 · 今天已玩 1 款：记事本」+ 待生效「改 3 款，07-27 13:53 生效」及取消按钮
+
 ## [v0.10.0] — 2026-07-26
 
 **改了什么**

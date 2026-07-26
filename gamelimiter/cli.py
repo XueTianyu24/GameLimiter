@@ -37,6 +37,9 @@ def cmd_add(conn, a):
 
 def cmd_list(conn, a):
     games = db.list_games(conn)
+    limit = db.get_daily_game_limit(conn)
+    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
+    print(f"全局：每天最多玩 {f'{limit} 款' if limit else '不限'}；今天已玩 {len(today)} 款")
     if not games:
         print("（无受限游戏）")
         return
@@ -103,6 +106,21 @@ def cmd_next(conn, a):
         sys.exit(1)
 
 
+def cmd_daily(conn, a):
+    """全局：一天内最多玩几款不同的游戏。不给值=查看，off=取消。"""
+    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
+    if a.count is None:
+        limit = db.get_daily_game_limit(conn)
+        print(f"每天最多玩：{f'{limit} 款' if limit else '不限'}；"
+              f"今天已玩 {len(today)} 款" + (f"（{'、'.join(today.values())}）" if today else ""))
+        for p in changes.global_pendings(conn):
+            print(f"  [{p['id']}] 待生效：{changes.describe_pending(p)}")
+        return
+    v = _num_or_off(a.count)
+    status, _, msg = changes.request_daily_limit(conn, v)
+    print(msg or "无变化")
+
+
 def cmd_remove(conn, a):
     g = db.get_game(conn, a.exe)
     if not g:
@@ -119,7 +137,8 @@ def cmd_pending(conn, a):
         return
     for p in rows:
         g = conn.execute("SELECT name FROM games WHERE id=?", (p["game_id"],)).fetchone()
-        print(f"[{p['id']}] {g['name'] if g else '?'} — {changes.describe_pending(p)}")
+        who = "全局" if p["game_id"] == changes.GLOBAL_GAME_ID else (g["name"] if g else "?")
+        print(f"[{p['id']}] {who} — {changes.describe_pending(p)}")
     if a.cancel:
         changes.cancel_pending(conn, a.cancel)
         print(f"已取消 [{a.cancel}]")
@@ -168,6 +187,10 @@ def main():
     p.add_argument("exe")
     p.add_argument("minutes", nargs="?", default=None, help="分钟数或 off；留空=查看")
     p.set_defaults(fn=cmd_next)
+
+    p = sub.add_parser("daily", help="全局：每天最多玩几款游戏（调小即时，调大延迟 24h）")
+    p.add_argument("count", nargs="?", default=None, help="款数或 off；留空=查看")
+    p.set_defaults(fn=cmd_daily)
 
     p = sub.add_parser("remove", help="删除游戏")
     p.add_argument("exe")

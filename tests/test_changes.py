@@ -15,7 +15,7 @@ from gamelimiter import config
 
 config.DB_PATH = Path(tempfile.mkdtemp()) / "test.db"   # 隔离测试库（须在 db.connect 前）
 
-from gamelimiter import changes, db
+from gamelimiter import changes, db, rules
 
 # ---- 分类 ----
 T = changes.is_tightening
@@ -105,5 +105,44 @@ assert not ok and "最短可设 40" in msg, msg
 assert changes.shorten_running_session(conn, g, sess, 60, now)[0]
 assert db.active_session(conn, g.id)["limit_minutes"] == 60
 db.close_session(conn, sid, int(now), "self_exit")
+
+# ---- 全局规则 d：每天最多玩几款 ----
+assert changes.is_tightening("daily_game_limit", None, 2)      # 从不限到 2 款 = 收紧
+assert changes.is_tightening("daily_game_limit", 3, 2)
+assert not changes.is_tightening("daily_game_limit", 2, 3)     # 放宽
+assert not changes.is_tightening("daily_game_limit", 2, None)  # 取消 = 放宽
+
+assert db.get_daily_game_limit(conn) is None
+assert changes.request_daily_limit(conn, 2)[0] == "applied"    # 收紧立即生效
+assert db.get_daily_game_limit(conn) == 2
+assert changes.request_daily_limit(conn, 2)[0] == "nochange"
+status, apply_at, _ = changes.request_daily_limit(conn, 4)     # 放宽入队，不立即改
+assert status == "delayed" and db.get_daily_game_limit(conn) == 2
+assert len(changes.global_pendings(conn)) == 1
+assert "每天最多玩 4 款" in changes.describe_pending(changes.global_pendings(conn)[0])
+assert changes.apply_due(conn, time.time()) == 0               # 未到期不落地
+assert changes.apply_due(conn, apply_at + 1) == 1              # 到期落地
+assert db.get_daily_game_limit(conn) == 4 and not changes.global_pendings(conn)
+# 改主意变严 → 撤销待生效的放宽
+changes.request_daily_limit(conn, 6)
+assert changes.request_daily_limit(conn, 1)[0] == "applied"
+assert db.get_daily_game_limit(conn) == 1 and not changes.global_pendings(conn)
+# 取消限制 = 放宽，也要等
+assert changes.request_daily_limit(conn, None)[0] == "delayed"
+assert db.get_daily_game_limit(conn) == 1
+
+# 今日已玩款数（跨午夜的会话两天都算）
+conn.execute("DELETE FROM sessions")
+gA = db.upsert_game(conn, "A", "a.exe")
+gB = db.upsert_game(conn, "B", "b.exe")
+day0, day1 = rules.day_bounds(time.time())
+db.open_session(conn, gA.id, int(day0 + 3600))                 # 今天，未结束
+db.close_session(conn, db.open_session(conn, gB.id, int(day0 - 7200)),
+                 int(day0 + 1800), "self_exit")                # 昨晚跨到今天凌晨
+db.close_session(conn, db.open_session(conn, gB.id, int(day0 - 7200)),
+                 int(day0 - 3600), "self_exit")                # 纯昨天，不算
+played = db.games_played_between(conn, day0, day1)
+assert set(played) == {gA.id, gB.id}, played
+assert db.games_played_between(conn, day1, day1 + 86400) == {}  # 明天还是空的
 
 print("test_changes: 全部通过")
