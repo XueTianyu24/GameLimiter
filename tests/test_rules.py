@@ -11,11 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gamelimiter.db import Game
 from gamelimiter.rules import (check_daily_limit, check_start, current_window_end, day_bounds,
-                               effective_limit, next_window_start, session_deadline)
+                               effective_limit, next_window_start, session_deadline,
+                               unlock_datetime)
 
 
-def g(cooldown=None, session=None, windows=None):
-    return Game(1, "测试", "test.exe", None, cooldown, session, windows, True)
+def g(cooldown=None, session=None, windows=None, until=None):
+    return Game(1, "测试", "test.exe", None, cooldown, session, windows, True,
+                next_allowed_date=until)
 
 
 def ts(s: str) -> float:
@@ -87,6 +89,27 @@ assert dl == (ts("2026-07-23 19:30"), "window_end"), dl
 # 上限不限、只给额度
 dl = session_deadline(g(), start, ts("2026-07-23 19:10"), 45)
 assert dl == (ts("2026-07-23 19:45"), "session_timeout"), dl
+
+# 规则 a 第二道门：下次可玩日
+mon = ts("2026-07-26 20:00")                                   # 参照“今天”
+v = check_start(g(until="2026-08-02"), None, mon)
+assert not v.allowed and v.reason == "locked_until_date", v
+assert v.unlock_ts == ts("2026-08-02 00:00") and "08月02日" in v.detail, v.detail
+# 有时段规则 → 解锁时刻顺延到那天第一个时段起点
+v = check_start(g(until="2026-08-02", windows=w), None, mon)
+assert v.unlock_ts == ts("2026-08-02 19:00"), v
+assert unlock_datetime("2026-08-02", w) == datetime.fromisoformat("2026-08-02 19:00")
+# 跨午夜时段覆盖 00:00 → 那天零点就解锁
+assert unlock_datetime("2026-08-02", w2) == datetime.fromisoformat("2026-08-02 00:00")
+# 到了那天 / 日期已过 → 不再拦
+assert check_start(g(until="2026-08-02"), None, ts("2026-08-02 09:00")).allowed
+assert check_start(g(until="2026-07-01"), None, mon).allowed
+# 日期门优先于冷却报告（更能说明问题）
+v = check_start(g(until="2026-08-02", cooldown=4), int(ts("2026-07-26 19:00")), mon)
+assert v.reason == "locked_until_date", v
+# 日期到了但冷却没到 → 照常报冷却
+v = check_start(g(until="2026-07-26", cooldown=4), int(ts("2026-07-26 19:00")), mon)
+assert v.reason == "cooldown", v
 
 # 全局规则 d：每天最多玩几款
 now = ts("2026-07-26 21:00")

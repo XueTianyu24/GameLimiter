@@ -11,7 +11,7 @@ from . import config, db, rules
 
 FIELD_ZH = {"cooldown_hours": "间隔冷却", "session_minutes": "单次最长时长",
             "windows": "允许时段", "enabled": "启用状态", "__delete__": "删除游戏",
-            "daily_game_limit": "每天最多玩几款"}
+            "daily_game_limit": "每天最多玩几款", "next_allowed_date": "下次可玩日"}
 
 # 全局设置在 pending_changes 里借 game_id=0 落座（games.id 从 1 起，不会撞）
 GLOBAL_GAME_ID = 0
@@ -24,6 +24,8 @@ def is_tightening(field: str, old, new) -> bool:
     if field in ("session_minutes", "daily_game_limit"):
         inf = float("inf")
         return (new or inf) <= (old or inf)                # 更短/更少 = 更严；None = 不限
+    if field == "next_allowed_date":
+        return (new or "") >= (old or "")   # 锁得更晚 = 更严；ISO 日期串可直接比大小，None 最松
     if field == "windows":
         return rules.coverage(new) <= rules.coverage(old)  # 可玩时间是子集 = 更严
     if field == "enabled":
@@ -60,7 +62,8 @@ def request_changes(conn, g: db.Game, fields: dict) -> tuple[dict, list]:
 
 def request_delete(conn, g: db.Game) -> Optional[int]:
     """申请删除。未受限游戏立即删（返回 None）；受限游戏延迟删（返回 apply_at）。"""
-    restricted = g.enabled and (g.cooldown_hours or g.session_minutes or g.windows)
+    restricted = g.enabled and (g.cooldown_hours or g.session_minutes or g.windows
+                                or g.next_allowed_date)
     if not restricted:
         db.remove_game(conn, g.id)
         return None
@@ -180,6 +183,8 @@ def describe_pending(p) -> str:
                 else f"取消「每天最多玩几款」限制，{t} 生效")
     if p["field"] == "enabled":
         desc = "停用限制"
+    elif p["field"] == "next_allowed_date":
+        desc = f"下次可玩日提前到 {v}" if v else "取消下次可玩日"
     elif p["field"] == "windows":
         desc = f"允许时段改为 {'、'.join(v) if v else '不限'}"
     elif p["field"] == "cooldown_hours":

@@ -35,6 +35,10 @@ assert not T("windows", ["19:00-23:00"], ["12:00-13:00"])    # 换到别的时�
 assert T("windows", ["22:00-01:00"], ["22:00-00:00"])        # 跨午夜子集
 assert T("enabled", 0, 1)                    # 启用 = 收紧
 assert not T("enabled", 1, 0)                # 停用 = 放宽
+assert T("next_allowed_date", None, "2026-08-02")            # 加锁 = 收紧
+assert T("next_allowed_date", "2026-08-02", "2026-08-05")    # 锁得更晚 = 收紧
+assert not T("next_allowed_date", "2026-08-05", "2026-08-02")  # 提前 = 放宽
+assert not T("next_allowed_date", "2026-08-02", None)        # 取消 = 放宽
 
 # ---- 落库流程 ----
 conn = db.connect()
@@ -105,6 +109,31 @@ assert not ok and "最短可设 40" in msg, msg
 assert changes.shorten_running_session(conn, g, sess, 60, now)[0]
 assert db.active_session(conn, g.id)["limit_minutes"] == 60
 db.close_session(conn, sid, int(now), "self_exit")
+
+# ---- 下次可玩日 ----
+gd = db.upsert_game(conn, "锁日期", "d.exe", session_minutes=90)
+applied, delayed = changes.request_changes(conn, gd, {"next_allowed_date": "2026-08-02"})
+assert applied == {"next_allowed_date": "2026-08-02"} and not delayed   # 加锁 = 收紧即时
+assert db.get_game(conn, "d.exe").next_allowed_date == "2026-08-02"
+# 往后推也是收紧
+applied, _ = changes.request_changes(conn, db.get_game(conn, "d.exe"),
+                                     {"next_allowed_date": "2026-08-05"})
+assert applied == {"next_allowed_date": "2026-08-05"}
+# 提前 = 放宽 → 入队不立即改
+_, delayed = changes.request_changes(conn, db.get_game(conn, "d.exe"),
+                                     {"next_allowed_date": "2026-07-27"})
+assert delayed and db.get_game(conn, "d.exe").next_allowed_date == "2026-08-05"
+assert "提前到 2026-07-27" in changes.describe_pending(db.list_pending(conn, gd.id)[0])
+# 改主意又往后推 → 撤销那条提前申请
+changes.request_changes(conn, db.get_game(conn, "d.exe"), {"next_allowed_date": "2026-08-09"})
+assert not db.list_pending(conn, gd.id)
+# 只设了日期的游戏也算受限，删除要走延迟
+assert changes.request_delete(conn, db.upsert_game(
+    conn, "只锁日期", "d2.exe", cooldown_hours=None)) is None      # 无任何规则 → 立即删
+gd3 = db.upsert_game(conn, "只锁日期", "d3.exe")
+changes.request_changes(conn, gd3, {"next_allowed_date": "2026-08-02"})
+assert changes.request_delete(conn, db.get_game(conn, "d3.exe")) is not None
+db.remove_game(conn, gd3.id)      # 清掉这条待删申请，免得污染后面的 apply_due 计数
 
 # ---- 全局规则 d：每天最多玩几款 ----
 assert changes.is_tightening("daily_game_limit", None, 2)      # 从不限到 2 款 = 收紧

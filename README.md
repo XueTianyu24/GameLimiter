@@ -11,6 +11,7 @@ Windows 11 上的游戏自我防沉迷工具：给自己的游戏加上"打不�
 | 规则 | 说明 |
 |---|---|
 | **间隔冷却** | 距上次游玩不满 N 小时 → 打不开 |
+| **下次可玩日** | 直接指定下次哪天才能玩（选日期或点「明天 / 后天 / 周六」），那天之前一律打不开。到了那天，仍按下面的时段与时长规则走。与冷却独立叠加，过期自动失效 |
 | **单次最长时长** | 单次最多玩 M 分钟，到点强制关闭 |
 | **允许时段** | 只有指定时段能打开；时段结束强制关闭 |
 
@@ -57,6 +58,7 @@ Windows 11 上的游戏自我防沉迷工具：给自己的游戏加上"打不�
 GameLimiter.exe --cli list          # 查看游戏与规则
 GameLimiter.exe --cli next <exe> 60 # 这次只玩 60 分钟（留空查看，off 清除）
 GameLimiter.exe --cli daily 2       # 每天最多玩 2 款游戏（留空查看，off 取消）
+GameLimiter.exe --cli set <exe> --until 2026-08-02   # 下次可玩日（也可 +3 / off）
 GameLimiter.exe --cli history       # 游玩记录与拦截事件
 GameLimiter.exe --cli pending       # 待生效的放宽变更（可 --cancel <id> 反悔）
 GameLimiter.exe --remove-system     # 卸载强制层（需管理员）

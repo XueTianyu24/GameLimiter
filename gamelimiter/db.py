@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS games (
     name TEXT NOT NULL,
     exe_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     exe_path TEXT,
-    cooldown_hours REAL,      -- 规则a 间隔冷却，NULL=未启用
+    cooldown_hours REAL,      -- 规则a 间隔冷却（小时级，同日兜底），NULL=未启用
+    next_allowed_date TEXT,   -- 规则a 第二道门：下次可玩日 'YYYY-MM-DD'，过期即失效，NULL=不限
     session_minutes REAL,     -- 规则b 单次最长时长（上限），NULL=未启用
     next_session_minutes REAL,-- 下次会话的一次性额度（≤上限），守护开会话时消费；NULL=用满上限
     windows TEXT,             -- 规则c 允许时段，JSON 数组 ["19:00-23:00"]，NULL=不限
@@ -70,12 +71,14 @@ class Game:
     enabled: bool
     icon: Optional[str] = None
     next_session_minutes: Optional[float] = None
+    next_allowed_date: Optional[str] = None    # 'YYYY-MM-DD'
 
 
 # 老库补列：(表, 列, 类型)。ALTER 幂等靠 duplicate column 异常兜底——守护与 GUI
 # 可能同时开库，先查 table_info 再 ALTER 仍有竞态窗口
 _MIGRATIONS = [("games", "icon", "TEXT"),
                ("games", "next_session_minutes", "REAL"),
+               ("games", "next_allowed_date", "TEXT"),
                ("sessions", "limit_minutes", "REAL")]
 
 
@@ -105,6 +108,7 @@ def _row_to_game(r: sqlite3.Row) -> Game:
         windows=json.loads(r["windows"]) if r["windows"] else None,
         enabled=bool(r["enabled"]), icon=r["icon"],
         next_session_minutes=r["next_session_minutes"],
+        next_allowed_date=r["next_allowed_date"],
     )
 
 
@@ -152,8 +156,9 @@ def set_next_session(conn, game_id: int, minutes: Optional[float]):
 
 
 def update_rules(conn, game_id: int, **fields):
-    """fields 可含 cooldown_hours / session_minutes / windows / enabled / name。"""
-    allowed = {"cooldown_hours", "session_minutes", "windows", "enabled", "name"}
+    """fields 可含 cooldown_hours / next_allowed_date / session_minutes / windows / enabled / name。"""
+    allowed = {"cooldown_hours", "next_allowed_date", "session_minutes",
+               "windows", "enabled", "name"}
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:

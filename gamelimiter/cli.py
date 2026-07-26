@@ -12,7 +12,7 @@
 import argparse
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from . import changes, db, rules
 
@@ -21,6 +21,16 @@ def _num_or_off(s):
     if s.lower() in ("off", "none", ""):
         return None
     return float(s)
+
+
+def _date_or_off(s):
+    """'2026-08-02' / '+3'（N 天后）/ off。"""
+    s = s.strip()
+    if s.lower() in ("off", "none", ""):
+        return None
+    if s.startswith("+"):
+        return (datetime.now().date() + timedelta(days=int(s[1:]))).isoformat()
+    return date.fromisoformat(s).isoformat()      # 格式不对直接抛，早报错好过存脏数据
 
 
 def _fmt_ts(ts):
@@ -53,6 +63,9 @@ def cmd_list(conn, a):
             rules_desc.append(f"时段 {'、'.join(g.windows)}")
         if g.next_session_minutes:
             rules_desc.append(f"下次额度 {g.next_session_minutes:g}min")
+        if g.next_allowed_date:
+            expired = g.next_allowed_date <= date.today().isoformat()
+            rules_desc.append(f"下次可玩日 {g.next_allowed_date}" + ("（已过）" if expired else ""))
         state = "" if g.enabled else "（已停用）"
         last = db.last_session_end(conn, g.id)
         print(f"[{g.id}] {g.name} ({g.exe_name}){state} — "
@@ -70,6 +83,8 @@ def cmd_set(conn, a):
         fields["session_minutes"] = _num_or_off(a.session)
     if a.windows is not None:
         fields["windows"] = a.windows or None
+    if a.until is not None:
+        fields["next_allowed_date"] = _date_or_off(a.until)
     if a.enable is not None:
         fields["enabled"] = int(a.enable)
     applied, delayed = changes.request_changes(conn, g, fields)
@@ -180,6 +195,8 @@ def main():
     p.add_argument("--cooldown", default=None)
     p.add_argument("--session", default=None)
     p.add_argument("--windows", nargs="*", default=None)
+    p.add_argument("--until", default=None,
+                   help="下次可玩日：2026-08-02 / +3（3 天后）/ off；往后推即时，提前延迟 24h")
     p.add_argument("--enable", type=int, choices=(0, 1), default=None)
     p.set_defaults(fn=cmd_set)
 

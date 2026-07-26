@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import webbrowser
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
 
@@ -54,6 +54,13 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
                  if g.next_session_minutes else
                  (cap_txt if g.session_minutes else ""))
         return "现在可玩", "bg-green-100 text-green-700", extra, False
+    if v.reason == "locked_until_date":
+        u = datetime.fromtimestamp(v.unlock_ts)
+        days = (u.date() - datetime.fromtimestamp(now).date()).days
+        return (f"锁定中 · {u.strftime('%m-%d')}（周{rules.WEEKDAY_ZH[u.weekday()]}）"
+                f"{u.strftime('%H:%M')} 开放",
+                "bg-violet-100 text-violet-700",
+                f"还有 {days} 天" if days > 0 else "今天晚些时候开放", False)
     if v.reason == "cooldown":
         t = datetime.fromtimestamp(v.unlock_ts).strftime("%H:%M")
         left = (v.unlock_ts - now) / 60
@@ -118,6 +125,12 @@ def game_avatar(g: db.Game):
     else:
         ui.label(g.name[:1].upper()).classes(
             f"{box} bg-sky-100 text-sky-600 font-bold flex items-center justify-center")
+
+
+def quick_dates(today: date) -> list[tuple[str, date]]:
+    """卡片上的快捷「下次可玩日」：明天 / 后天 / 下一个周六（今天就是周六则下周六）。"""
+    sat = today + timedelta(days=(5 - today.weekday()) % 7 or 7)
+    return [("明天", today + timedelta(1)), ("后天", today + timedelta(2)), ("周六", sat)]
 
 
 def game_card(g: db.Game):
@@ -285,6 +298,63 @@ def game_card(g: db.Game):
                 save()
             w_start.on_value_change(on_start_change)
             w_end.on_value_change(save)
+
+        # 规则 a 第二道门：下次可玩日（跨天规划）。到了那天仍按时段/时长规则走
+        today = date.today()
+        locked = g.next_allowed_date and g.next_allowed_date > today.isoformat()
+        with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+            ui.label("下次可玩").classes("text-xs text-slate-500 shrink-0")
+            # 菜单必须建在 input 的上下文里，否则它锚到整行、弹出位置会跑偏
+            with ui.input(value=g.next_allowed_date or "", placeholder="不限") \
+                    .classes("w-[108px]").props("dense") as d_in:
+                d_in.tooltip("那天之前一律打不开；到了那天按允许时段开放。"
+                             "往后推立即生效，提前要等 24 小时")
+                with ui.menu().props("no-parent-event") as d_menu:
+                    ui.date(value=g.next_allowed_date or None,
+                            on_change=lambda e: (d_menu.close(), save_date(e.value)))
+                with d_in.add_slot("append"):
+                    ui.icon("edit_calendar").classes("cursor-pointer text-slate-400") \
+                        .on("click", d_menu.open)
+            if not g.next_allowed_date:
+                ui.label("· 还没定下次").classes("text-xs text-slate-400")
+            elif not locked:
+                ui.label("· 已过期，不限").classes("text-xs text-slate-400")
+        with ui.row().classes("w-full items-center gap-1 flex-nowrap -mt-1"):
+            for label, dd in quick_dates(today):
+                ui.button(label, on_click=lambda dd=dd: save_date(dd.isoformat())) \
+                    .props("flat dense size=sm color=grey")
+            ui.space()
+            ui.button("清除", on_click=lambda: save_date(None)) \
+                .props("flat dense size=sm color=grey")
+
+        def save_typed(d_in=d_in):
+            """手敲日期的兜底通道（不依赖日历弹窗）。"""
+            v = (d_in.value or "").strip()
+            if v:
+                try:
+                    v = date.fromisoformat(v).isoformat()
+                except ValueError:
+                    ui.notify("日期格式应为 2026-08-02", type="warning")
+                    games_view.refresh()
+                    return
+            save_date(v or None)
+        d_in.on("blur", save_typed)
+        d_in.on("keydown.enter", save_typed)
+
+        def save_date(v, gid=g.id):
+            fresh = db._row_to_game(
+                conn.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone())
+            applied, delayed = changes.request_changes(
+                conn, fresh, {"next_allowed_date": v or None})
+            if not applied and not delayed:
+                return
+            if delayed:
+                t = datetime.fromtimestamp(delayed[0][2]).strftime("%m-%d %H:%M")
+                ui.notify(f"提前解锁属于放宽，{t} 生效（期间可随时取消）", type="warning")
+            else:
+                ui.notify(f"已锁定到 {v}，那天之前打不开" if v else "已取消下次可玩日",
+                          type="positive")
+            games_view.refresh()
 
         pendings = db.list_pending(conn, g.id)
         if pendings:

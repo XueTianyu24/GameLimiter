@@ -1,6 +1,8 @@
 """三规则引擎：纯函数，不碰 DB / 进程。
 
-(a) cooldown_hours   间隔冷却：now >= 上次会话结束 + N 小时 才允许启动
+(a) cooldown_hours     间隔冷却：now >= 上次会话结束 + N 小时 才允许启动
+    next_allowed_date  下次可玩日：那天（的第一个允许时段）之前一律打不开。两道门独立
+                       叠加——冷却管"同一天别连着再来"，日期管跨天规划
 (b) session_minutes  单次最长时长（上限）：deadline = 会话开始 + N 分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
 (d) daily_game_limit **全局**：一天内最多玩几款不同的游戏（不挂在单个游戏上）
@@ -11,7 +13,9 @@ a/b/c 三条按游戏配置、可叠加；deadline 取最早者。规则收紧�
 """
 
 from dataclasses import dataclass
+from datetime import date as dt_date
 from datetime import datetime, timedelta
+from datetime import time as dt_time
 from typing import Optional
 
 from .db import Game
@@ -81,9 +85,32 @@ def check_daily_limit(limit: Optional[int], today: dict, game_id: int,
                         f"这款今天还没玩过，明天 0:00 后可以开", tomorrow)
 
 
+WEEKDAY_ZH = "一二三四五六日"
+
+
+def unlock_datetime(date_str: str, windows: Optional[list]) -> datetime:
+    """「下次可玩日」实际解锁的时刻：那天 0:00，有时段规则则顺延到那天第一个时段起点。"""
+    day0 = datetime.combine(dt_date.fromisoformat(date_str), dt_time.min)
+    if windows and current_window_end(windows, day0) is None:
+        nxt = next_window_start(windows, day0)
+        if nxt:
+            return nxt
+    return day0
+
+
 def check_start(game: Game, last_end_ts: Optional[int], now_ts: float) -> StartVerdict:
-    """启动前检查：冷却 + 时段。"""
+    """启动前检查：下次可玩日 + 冷却 + 时段。"""
     now = datetime.fromtimestamp(now_ts)
+
+    # 规则 a 第一道门：锁到某天（跨天规划）。过期即失效，不用手动清
+    if game.next_allowed_date:
+        unlock = unlock_datetime(game.next_allowed_date, game.windows)
+        if now < unlock:
+            return StartVerdict(False, "locked_until_date",
+                                f"已锁定到 {unlock.strftime('%m月%d日')}"
+                                f"（周{WEEKDAY_ZH[unlock.weekday()]}）"
+                                f"{unlock.strftime('%H:%M')}，在那之前打不开",
+                                unlock.timestamp())
 
     if game.cooldown_hours and last_end_ts:
         unlock = last_end_ts + game.cooldown_hours * 3600
