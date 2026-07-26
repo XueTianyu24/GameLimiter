@@ -1,9 +1,12 @@
 """三规则引擎：纯函数，不碰 DB / 进程。
 
 (a) cooldown_hours   间隔冷却：now >= 上次会话结束 + N 小时 才允许启动
-(b) session_minutes  单次时长：deadline = 会话开始 + N 分钟
+(b) session_minutes  单次最长时长（上限）：deadline = 会话开始 + N 分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
 三规则可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
+
+规则 b 是**上限**：每次会话可另给一个"本次额度"（`limit_minutes`），与上限取更严者。
+额度只能收紧不能放宽——这是防冲动的核心，见 `changes.set_next_session`。
 """
 
 from dataclasses import dataclass
@@ -79,14 +82,26 @@ def check_start(game: Game, last_end_ts: Optional[int], now_ts: float) -> StartV
     return StartVerdict(True)
 
 
-def session_deadline(game: Game, start_ts: int, now_ts: float) -> Optional[tuple[float, str]]:
+def effective_limit(cap: Optional[float], chosen: Optional[float]) -> Optional[float]:
+    """本次会话实际生效的时长（分钟）：上限与本次额度取更严者，都没有则不限。
+
+    额度可以在"上限=不限"的游戏上单独生效（临时给自己设个数），那也是收紧。
+    """
+    vals = [v for v in (cap, chosen) if v]
+    return min(vals) if vals else None
+
+
+def session_deadline(game: Game, start_ts: int, now_ts: float,
+                     limit_minutes: Optional[float] = None) -> Optional[tuple[float, str]]:
     """运行中会话的最早强制截止 (deadline_ts, reason)；无 b/c 规则返回 None。
 
+    `limit_minutes` = 本次会话额度（会话行快照），与游戏上限取更严者。
     时段规则：若 now 已在时段外（时段中途结束/规则收紧），deadline=now 立即到点。
     """
     cands: list[tuple[float, str]] = []
-    if game.session_minutes:
-        cands.append((start_ts + game.session_minutes * 60, "session_timeout"))
+    limit = effective_limit(game.session_minutes, limit_minutes)
+    if limit:
+        cands.append((start_ts + limit * 60, "session_timeout"))
     if game.windows:
         end = current_window_end(game.windows, datetime.fromtimestamp(now_ts))
         cands.append((end.timestamp(), "window_end") if end else (now_ts, "window_end"))

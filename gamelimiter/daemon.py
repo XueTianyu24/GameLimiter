@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import psutil
 
@@ -50,6 +51,7 @@ class ActiveSession:
     session_id: int
     game_id: int
     start_ts: int
+    limit_minutes: Optional[float] = None      # 本次额度（≤上限），None=用满上限
     warned: set = field(default_factory=set)   # 已触发的预警分钟档
 
 
@@ -128,7 +130,8 @@ class Daemon:
             g = all_games.get(row["game_id"])
             alive = g and procs.get(g.exe_name.lower())
             if alive:
-                self.active[g.id] = ActiveSession(row["id"], g.id, row["start_ts"])
+                self.active[g.id] = ActiveSession(row["id"], g.id, row["start_ts"],
+                                                  row["limit_minutes"])
                 log.info(f"收养进行中会话：{g.name}（开始于 {_fmt(row['start_ts'])}）")
             else:
                 db.close_session(self.conn, row["id"], int(time.time()), "daemon_restart")
@@ -144,13 +147,20 @@ class Daemon:
             popup(f"GameLimiter — {g.name} 已被拦截", verdict.detail)
             return
 
-        sid = db.open_session(self.conn, g.id, int(now))
-        self.active[g.id] = ActiveSession(sid, g.id, int(now))
-        dl = rules.session_deadline(g, int(now), now)
-        log.info(f"会话开始：{g.name}" + (f"，截止 {_fmt(dl[0])}（{dl[1]}）" if dl else ""))
+        # 本次额度：开会话即消费掉（含内存里的 games 缓存，否则秒退再进会重复用）
+        quota = g.next_session_minutes
+        sid = db.open_session(self.conn, g.id, int(now), quota)
+        if quota is not None:
+            db.set_next_session(self.conn, g.id, None)
+            g.next_session_minutes = None
+        self.active[g.id] = ActiveSession(sid, g.id, int(now), quota)
+        dl = rules.session_deadline(g, int(now), now, quota)
+        log.info(f"会话开始：{g.name}" + (f"（本次额度 {quota:g} 分钟）" if quota else "")
+                 + (f"，截止 {_fmt(dl[0])}（{dl[1]}）" if dl else ""))
         if dl:
+            quota_note = f"本次额度 {quota:g} 分钟；" if quota else ""
             popup(f"GameLimiter — {g.name}",
-                  f"本次会话已开始，最晚 {_fmt(dl[0])[:5]} 结束"
+                  f"{quota_note}本次会话已开始，最晚 {_fmt(dl[0])[:5]} 结束"
                   f"（{rules.REASON_TEXT[dl[1]]}前会提前预警）", warn=False)
 
     def _handle_running(self, g: db.Game, sess: ActiveSession,
@@ -161,7 +171,7 @@ class Daemon:
             log.info(f"会话结束（自行退出）：{g.name}")
             return
 
-        dl = rules.session_deadline(g, sess.start_ts, now)
+        dl = rules.session_deadline(g, sess.start_ts, now, sess.limit_minutes)
         if dl is None:
             return
         deadline, reason = dl
@@ -176,15 +186,24 @@ class Daemon:
             popup(f"GameLimiter — {g.name} 已关闭", rules.REASON_TEXT[reason])
             return
 
-        for m in WARN_MINUTES:
-            if remaining <= m * 60 and m not in sess.warned:
-                sess.warned.add(m)
-                db.log_event(self.conn, g.id, "warn", f"{m}min")
-                log.info(f"预警：{g.name} 剩余 {remaining/60:.1f} 分钟（{reason}）")
-                popup(f"GameLimiter — {g.name} 剩余 {int(remaining/60) + 1} 分钟",
-                      f"{rules.REASON_TEXT[reason]}，将于 {_fmt(deadline)[:5]} 强制关闭，"
-                      f"请尽快结束当前对局并自行退出")
-                break
+        # 一次把所有已跨过的档标记掉：额度短于最大档时（如本次只玩 5 分钟），
+        # 逐档触发会连着几秒弹三次窗——游戏里被连弹是灾难
+        crossed = [m for m in WARN_MINUTES if remaining <= m * 60]
+        if crossed and any(m not in sess.warned for m in crossed):
+            sess.warned.update(crossed)
+            db.log_event(self.conn, g.id, "warn", f"{min(crossed)}min")
+            log.info(f"预警：{g.name} 剩余 {remaining/60:.1f} 分钟（{reason}）")
+            popup(f"GameLimiter — {g.name} 剩余 {int(remaining/60) + 1} 分钟",
+                  f"{rules.REASON_TEXT[reason]}，将于 {_fmt(deadline)[:5]} 强制关闭，"
+                  f"请尽快结束当前对局并自行退出")
+
+    def _refresh_active_limits(self):
+        """把 GUI/CLI 对进行中会话的额度改动（只可能是缩短）读回内存。"""
+        for row in db.open_sessions(self.conn):
+            sess = self.active.get(row["game_id"])
+            if sess and sess.session_id == row["id"] and sess.limit_minutes != row["limit_minutes"]:
+                log.info(f"会话额度更新：session {sess.session_id} → {row['limit_minutes']} 分钟")
+                sess.limit_minutes = row["limit_minutes"]
 
     def _ensure_watchdog(self, now: float):
         if os.environ.get("GAMELIMITER_NO_WATCHDOG") == "1":
@@ -201,6 +220,7 @@ class Daemon:
             if n:
                 log.info(f"应用 {n} 条到期的放宽变更")
             self.reload_games()
+            self._refresh_active_limits()
             self._ensure_watchdog(now)
         procs = _scan_procs(self.exe_names())
         enabled_ids = set()

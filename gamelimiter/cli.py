@@ -4,15 +4,17 @@
   python -m gamelimiter.cli add 永劫无间 NarakaBladepoint.exe --cooldown 4 --session 90 --windows 19:00-23:00
   python -m gamelimiter.cli list
   python -m gamelimiter.cli set notepad.exe --session off --cooldown 2
+  python -m gamelimiter.cli next NarakaBladepoint.exe 60     # 这次只玩 60 分钟
   python -m gamelimiter.cli remove notepad.exe
   python -m gamelimiter.cli history
 """
 
 import argparse
 import sys
+import time
 from datetime import datetime
 
-from . import changes, db
+from . import changes, db, rules
 
 
 def _num_or_off(s):
@@ -43,9 +45,11 @@ def cmd_list(conn, a):
         if g.cooldown_hours:
             rules_desc.append(f"冷却 {g.cooldown_hours:g}h")
         if g.session_minutes:
-            rules_desc.append(f"单次 {g.session_minutes:g}min")
+            rules_desc.append(f"单次最长 {g.session_minutes:g}min")
         if g.windows:
             rules_desc.append(f"时段 {'、'.join(g.windows)}")
+        if g.next_session_minutes:
+            rules_desc.append(f"下次额度 {g.next_session_minutes:g}min")
         state = "" if g.enabled else "（已停用）"
         last = db.last_session_end(conn, g.id)
         print(f"[{g.id}] {g.name} ({g.exe_name}){state} — "
@@ -72,6 +76,31 @@ def cmd_set(conn, a):
         print(f"放宽延迟：{changes.FIELD_ZH[f]} → {_fmt_ts(apply_at)} 生效")
     if not applied and not delayed:
         print("无变化")
+
+
+def cmd_next(conn, a):
+    """本次/下次游玩额度：不给值=查看，给数值=设置，off=清除。"""
+    g = db.get_game(conn, a.exe)
+    if not g:
+        sys.exit(f"未找到 {a.exe}")
+    sess = db.active_session(conn, g.id)
+    if a.minutes is None:
+        cap = f"{g.session_minutes:g} 分钟" if g.session_minutes else "不限"
+        if sess:
+            cur = rules.effective_limit(g.session_minutes, sess["limit_minutes"])
+            print(f"{g.name} 游玩中：本次 {f'{cur:g} 分钟' if cur else '不限'}"
+                  f"（已玩 {(time.time() - sess['start_ts'])/60:.0f} 分钟，上限 {cap}）")
+        else:
+            print(f"{g.name}：下次额度 "
+                  f"{f'{g.next_session_minutes:g} 分钟' if g.next_session_minutes else '（未设，按上限）'}"
+                  f"，上限 {cap}")
+        return
+    v = _num_or_off(a.minutes)
+    ok, msg = (changes.shorten_running_session(conn, g, sess, v) if sess
+               else changes.set_next_session(conn, g, v))
+    print(msg or "无变化")
+    if not ok:
+        sys.exit(1)
 
 
 def cmd_remove(conn, a):
@@ -102,8 +131,9 @@ def cmd_history(conn, a):
            ORDER BY s.id DESC LIMIT ?""", (a.limit,)).fetchall()
     for r in rows:
         dur = f"{(r['end_ts'] - r['start_ts'])/60:.1f}min" if r["end_ts"] else "进行中"
+        quota = f"  [额度 {r['limit_minutes']:g}min]" if r["limit_minutes"] else ""
         print(f"{r['name']}  {_fmt_ts(r['start_ts'])} → {_fmt_ts(r['end_ts'])}"
-              f"  {dur}  {r['end_reason'] or ''}")
+              f"  {dur}  {r['end_reason'] or ''}{quota}")
     rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (a.limit,)).fetchall()
     print("--- 事件 ---")
     for r in rows:
@@ -119,7 +149,7 @@ def main():
     p.add_argument("exe", help="进程名，如 NarakaBladepoint.exe")
     p.add_argument("--path", default=None)
     p.add_argument("--cooldown", type=float, default=None, help="间隔冷却（小时）")
-    p.add_argument("--session", type=float, default=None, help="单次时长（分钟）")
+    p.add_argument("--session", type=float, default=None, help="单次最长时长（分钟，上限）")
     p.add_argument("--windows", nargs="*", default=None, help="允许时段，如 19:00-23:00")
     p.set_defaults(fn=cmd_add)
 
@@ -133,6 +163,11 @@ def main():
     p.add_argument("--windows", nargs="*", default=None)
     p.add_argument("--enable", type=int, choices=(0, 1), default=None)
     p.set_defaults(fn=cmd_set)
+
+    p = sub.add_parser("next", help="本次/下次游玩额度（≤上限；游玩中只可缩短）")
+    p.add_argument("exe")
+    p.add_argument("minutes", nargs="?", default=None, help="分钟数或 off；留空=查看")
+    p.set_defaults(fn=cmd_next)
 
     p = sub.add_parser("remove", help="删除游戏")
     p.add_argument("exe")

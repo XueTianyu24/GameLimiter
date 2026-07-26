@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS games (
     exe_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     exe_path TEXT,
     cooldown_hours REAL,      -- 规则a 间隔冷却，NULL=未启用
-    session_minutes REAL,     -- 规则b 单次时长，NULL=未启用
+    session_minutes REAL,     -- 规则b 单次最长时长（上限），NULL=未启用
+    next_session_minutes REAL,-- 下次会话的一次性额度（≤上限），守护开会话时消费；NULL=用满上限
     windows TEXT,             -- 规则c 允许时段，JSON 数组 ["19:00-23:00"]，NULL=不限
     icon TEXT,                -- 从 exe 提取的 PNG data URI，NULL=没取到（GUI 退回首字母块）
     enabled INTEGER NOT NULL DEFAULT 1,
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     game_id INTEGER NOT NULL REFERENCES games(id),
     start_ts INTEGER NOT NULL,
     end_ts INTEGER,
-    end_reason TEXT           -- self_exit / session_timeout / window_end / disabled / daemon_restart
+    end_reason TEXT,          -- self_exit / session_timeout / window_end / disabled / daemon_restart
+    limit_minutes REAL        -- 本次生效额度快照，NULL=用满上限；进行中只可改小
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,15 +61,18 @@ class Game:
     exe_name: str
     exe_path: Optional[str]
     cooldown_hours: Optional[float]
-    session_minutes: Optional[float]
+    session_minutes: Optional[float]   # 单次最长（上限）
     windows: Optional[list]   # ["19:00-23:00", ...]
     enabled: bool
     icon: Optional[str] = None
+    next_session_minutes: Optional[float] = None
 
 
 # 老库补列：(表, 列, 类型)。ALTER 幂等靠 duplicate column 异常兜底——守护与 GUI
 # 可能同时开库，先查 table_info 再 ALTER 仍有竞态窗口
-_MIGRATIONS = [("games", "icon", "TEXT")]
+_MIGRATIONS = [("games", "icon", "TEXT"),
+               ("games", "next_session_minutes", "REAL"),
+               ("sessions", "limit_minutes", "REAL")]
 
 
 def _migrate(conn):
@@ -95,6 +100,7 @@ def _row_to_game(r: sqlite3.Row) -> Game:
         cooldown_hours=r["cooldown_hours"], session_minutes=r["session_minutes"],
         windows=json.loads(r["windows"]) if r["windows"] else None,
         enabled=bool(r["enabled"]), icon=r["icon"],
+        next_session_minutes=r["next_session_minutes"],
     )
 
 
@@ -134,6 +140,13 @@ def set_icon(conn, game_id: int, icon: Optional[str]):
     conn.commit()
 
 
+def set_next_session(conn, game_id: int, minutes: Optional[float]):
+    """设置/清除下次会话的一次性额度。不动 updated_at——这不是规则变更，
+    额度永远只能比上限更严，走不到放宽延迟那套（校验在 changes 层）。"""
+    conn.execute("UPDATE games SET next_session_minutes=? WHERE id=?", (minutes, game_id))
+    conn.commit()
+
+
 def update_rules(conn, game_id: int, **fields):
     """fields 可含 cooldown_hours / session_minutes / windows / enabled / name。"""
     allowed = {"cooldown_hours", "session_minutes", "windows", "enabled", "name"}
@@ -160,10 +173,18 @@ def remove_game(conn, game_id: int):
 
 # ---- 会话 ----
 
-def open_session(conn, game_id: int, start_ts: int) -> int:
-    cur = conn.execute("INSERT INTO sessions (game_id, start_ts) VALUES (?,?)", (game_id, start_ts))
+def open_session(conn, game_id: int, start_ts: int,
+                 limit_minutes: Optional[float] = None) -> int:
+    cur = conn.execute("INSERT INTO sessions (game_id, start_ts, limit_minutes) VALUES (?,?,?)",
+                       (game_id, start_ts, limit_minutes))
     conn.commit()
     return cur.lastrowid
+
+
+def set_session_limit(conn, session_id: int, minutes: Optional[float]):
+    """改进行中会话的额度（只允许缩短，校验在 changes 层）。"""
+    conn.execute("UPDATE sessions SET limit_minutes=? WHERE id=?", (minutes, session_id))
+    conn.commit()
 
 
 def close_session(conn, session_id: int, end_ts: int, reason: str):
@@ -173,6 +194,11 @@ def close_session(conn, session_id: int, end_ts: int, reason: str):
 
 def open_sessions(conn) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM sessions WHERE end_ts IS NULL").fetchall()
+
+
+def active_session(conn, game_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sessions WHERE game_id=? AND end_ts IS NULL", (game_id,)).fetchone()
 
 
 def last_session_end(conn, game_id: int) -> Optional[int]:

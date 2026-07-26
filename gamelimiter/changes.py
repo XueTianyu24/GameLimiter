@@ -9,7 +9,7 @@ from typing import Optional
 
 from . import config, db, rules
 
-FIELD_ZH = {"cooldown_hours": "间隔冷却", "session_minutes": "单次时长",
+FIELD_ZH = {"cooldown_hours": "间隔冷却", "session_minutes": "单次最长时长",
             "windows": "允许时段", "enabled": "启用状态", "__delete__": "删除游戏"}
 
 
@@ -65,6 +65,53 @@ def request_delete(conn, g: db.Game) -> Optional[int]:
     return apply_at
 
 
+# ---- 本次游玩额度（规则 b 的一次性收紧）----
+
+def set_next_session(conn, g: db.Game, minutes) -> tuple[bool, str]:
+    """设置下次会话的一次性额度（分钟）；None / 0 = 清除，回到上限。
+
+    额度只能 ≤ 上限，永远不构成放宽 → 立即生效，不进待生效队列。
+    放宽上限本身仍走 request_changes 的 24h 延迟。
+    """
+    minutes = float(minutes) if minutes else None
+    if minutes is not None:
+        if minutes <= 0:
+            minutes = None
+        elif g.session_minutes and minutes > g.session_minutes:
+            return False, f"本次额度不能超过单次最长 {g.session_minutes:g} 分钟"
+    if minutes == g.next_session_minutes:
+        return True, ""
+    db.set_next_session(conn, g.id, minutes)
+    db.log_event(conn, g.id, "quota", f"next={minutes:g}min" if minutes else "next=cleared")
+    if minutes is None:
+        cap = f"{g.session_minutes:g} 分钟" if g.session_minutes else "不限"
+        return True, f"已清除本次额度，下次按上限（{cap}）"
+    return True, f"下次游玩限 {minutes:g} 分钟"
+
+
+def shorten_running_session(conn, g: db.Game, sess, minutes,
+                            now: Optional[float] = None) -> tuple[bool, str]:
+    """改进行中会话的额度：**只许缩短**——玩到一半想加时正是要拦的冲动。
+
+    下限 = 已玩 + 最长预警档：缩短后仍要收得到预警，PVP 被无预警强杀会判逃跑。
+    """
+    now = now or time.time()
+    minutes = float(minutes) if minutes else None
+    if minutes is None:
+        return False, "游玩中不能取消本次额度，只能缩短"
+    cur = rules.effective_limit(g.session_minutes, sess["limit_minutes"])
+    if cur and minutes >= cur:
+        return False, f"游玩中只能缩短本次时长（当前 {cur:g} 分钟），不能加时"
+    played = (now - sess["start_ts"]) / 60
+    buffer = max(config.WARN_MINUTES)
+    if minutes < played + buffer:
+        return False, (f"本次已玩 {played:.0f} 分钟，需留 {buffer:g} 分钟预警缓冲，"
+                       f"最短可设 {played + buffer:.0f} 分钟")
+    db.set_session_limit(conn, sess["id"], minutes)
+    db.log_event(conn, g.id, "quota", f"session={minutes:g}min")
+    return True, f"本次游玩缩短到 {minutes:g} 分钟"
+
+
 def cancel_pending(conn, pending_id: int):
     """取消待生效的放宽（保持更严的现状，随时允许）。"""
     db.delete_pending(conn, pending_id)
@@ -98,5 +145,5 @@ def describe_pending(p) -> str:
     elif p["field"] == "cooldown_hours":
         desc = f"冷却改为 {f'{v:g} 小时' if v else '无'}"
     else:
-        desc = f"单次改为 {f'{v:g} 分钟' if v else '不限'}"
+        desc = f"单次最长改为 {f'{v:g} 分钟' if v else '不限'}"
     return f"{desc}，{t} 生效"

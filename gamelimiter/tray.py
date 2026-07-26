@@ -97,18 +97,38 @@ _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 
+def _playing_text(conn) -> str:
+    """正在游玩的那款 + 剩余时间（本次额度已算进去）；没在玩返回空串。"""
+    import time
+
+    from . import db, rules
+    now = time.time()
+    games = {g.id: g for g in db.list_games(conn)}
+    for row in db.open_sessions(conn):
+        g = games.get(row["game_id"])
+        if not g:
+            continue
+        dl = rules.session_deadline(g, row["start_ts"], now, row["limit_minutes"])
+        return (f"{g.name} 剩 {max(0, (dl[0] - now) / 60):.0f} 分钟" if dl
+                else f"{g.name} 游玩中")
+    return ""
+
+
 def _status_text() -> str:
-    """托盘 tooltip / 菜单首行：今日已玩 + 守护状态。"""
+    """托盘 tooltip / 菜单首行：游玩中剩余 + 今日已玩 + 守护状态。"""
+    playing = ""
     try:
         from . import db, stats
         conn = db.connect()
         today = date.today()
         s = stats.summary(conn, today, today)
+        playing = _playing_text(conn)
         conn.close()
         played = f"今日已玩 {s.hours_text}" if s.minutes else "今日还没玩"
     except Exception:                                    # noqa: BLE001
         played = "今日数据读取失败"
-    return f"{played}｜守护{'运行中' if mutex_exists(DAEMON_MUTEX) else '未运行'}"
+    head = f"{playing}｜" if playing else ""
+    return f"{head}{played}｜守护{'运行中' if mutex_exists(DAEMON_MUTEX) else '未运行'}"
 
 
 def _open_panel():

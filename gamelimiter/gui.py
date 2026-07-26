@@ -29,33 +29,38 @@ PORT = 8788
 # ---------------- 数据/状态 ----------------
 
 
-def game_state(g: db.Game) -> tuple[str, str, str]:
-    """返回 (chip文本, chip颜色类, 副注)。颜色类 = tailwind bg/text。"""
+def game_state(g: db.Game) -> tuple[str, str, str, bool]:
+    """返回 (chip文本, chip颜色类, 副注, 是否游玩中)。颜色类 = tailwind bg/text。"""
     now = time.time()
-    sess = conn.execute(
-        "SELECT * FROM sessions WHERE game_id=? AND end_ts IS NULL", (g.id,)).fetchone()
+    sess = db.active_session(conn, g.id)
     if not g.enabled:
-        return "已停用（不受限制）", "bg-gray-100 text-gray-500", ""
+        return "已停用（不受限制）", "bg-gray-100 text-gray-500", "", bool(sess)
     if sess:
-        dl = rules.session_deadline(g, sess["start_ts"], now)
+        dl = rules.session_deadline(g, sess["start_ts"], now, sess["limit_minutes"])
         played = (now - sess["start_ts"]) / 60
+        note = f"本次已玩 {played:.0f} 分钟"
+        if sess["limit_minutes"]:
+            note += f" · 本次额度 {sess['limit_minutes']:g} 分钟"
         if dl:
             t = datetime.fromtimestamp(dl[0]).strftime("%H:%M")
             left = max(0, (dl[0] - now) / 60)
             return (f"游玩中 · {t} 强制结束（剩 {left:.0f} 分钟）",
-                    "bg-blue-100 text-blue-700", f"本次已玩 {played:.0f} 分钟")
-        return "游玩中 · 无时长限制", "bg-blue-100 text-blue-700", f"本次已玩 {played:.0f} 分钟"
+                    "bg-blue-100 text-blue-700", note, True)
+        return "游玩中 · 无时长限制", "bg-blue-100 text-blue-700", note, True
     v = rules.check_start(g, db.last_session_end(conn, g.id), now)
+    cap_txt = f"单次最长 {g.session_minutes:g} 分钟" if g.session_minutes else "单次时长不限"
     if v.allowed:
-        extra = f"单次最长 {g.session_minutes:g} 分钟" if g.session_minutes else ""
-        return "现在可玩", "bg-green-100 text-green-700", extra
+        extra = (f"下次限 {g.next_session_minutes:g} 分钟（{cap_txt}）"
+                 if g.next_session_minutes else
+                 (cap_txt if g.session_minutes else ""))
+        return "现在可玩", "bg-green-100 text-green-700", extra, False
     if v.reason == "cooldown":
         t = datetime.fromtimestamp(v.unlock_ts).strftime("%H:%M")
         left = (v.unlock_ts - now) / 60
         left_s = f"{left/60:.1f} 小时" if left > 90 else f"{left:.0f} 分钟"
-        return f"冷却中 · {t} 解锁（还差 {left_s}）", "bg-amber-100 text-amber-700", ""
+        return f"冷却中 · {t} 解锁（还差 {left_s}）", "bg-amber-100 text-amber-700", "", False
     t = datetime.fromtimestamp(v.unlock_ts).strftime("%H:%M") if v.unlock_ts else "?"
-    return f"时段外 · 最近 {t} 开放", "bg-slate-200 text-slate-600", ""
+    return f"时段外 · 最近 {t} 开放", "bg-slate-200 text-slate-600", "", False
 
 
 def daemon_running() -> bool:
@@ -161,15 +166,59 @@ def game_card(g: db.Game):
         chip = ui.label().classes("px-3 py-1 rounded-full text-sm font-medium")
         sub = ui.label().classes("text-xs text-slate-400")
 
-        def upd(gid=g.id, chip=chip, sub=sub):
+        # 本次/下次游玩额度：规则 b 的一次性收紧（≤上限；游玩中只许缩短）
+        sess0 = db.active_session(conn, g.id)
+        q_init = (sess0["limit_minutes"] if sess0 else g.next_session_minutes) or g.session_minutes
+        with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+            q_label = ui.label().classes("text-xs text-slate-500 shrink-0")
+            ui.button(icon="remove", on_click=lambda: bump(-30)) \
+                .props("flat dense round size=sm color=grey").tooltip("减 30 分钟")
+            q = ui.number(value=q_init, min=0, step=30).classes("w-[62px]").props("dense") \
+                .tooltip("本次实际能玩多久（可直接输入；不超过上限）")
+            ui.button(icon="add", on_click=lambda: bump(30)) \
+                .props("flat dense round size=sm color=grey").tooltip("加 30 分钟")
+            ui.label("分钟").classes("text-xs text-slate-500 shrink-0")
+            ui.space()
+            q_full = ui.button("用满上限", on_click=lambda: (q.set_value(None), commit_quota())) \
+                .props("flat dense size=sm color=grey")
+
+        def commit_quota(gid=g.id, q=q):
+            fresh = db._row_to_game(
+                conn.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone())
+            sess = db.active_session(conn, gid)
+            val = q.value
+            if sess:
+                ok, msg = changes.shorten_running_session(conn, fresh, sess, val)
+            else:
+                if fresh.session_minutes and val and val >= fresh.session_minutes:
+                    val = None                      # 顶到上限 = 不额外限制
+                ok, msg = changes.set_next_session(conn, fresh, val)
+            if not msg:                             # 值没变（blur 空转）→ 别重建卡片
+                return
+            ui.notify(msg, type="positive" if ok else "warning")
+            games_view.refresh()                    # 重建卡片：被拒时输入框自动回填真实值
+
+        def bump(d, q=q):
+            q.value = max(0, round((q.value or 0) + d))
+            commit_quota()
+        q.on("blur", commit_quota)
+        q.on("keydown.enter", commit_quota)
+
+        def upd(gid=g.id, chip=chip, sub=sub, q_label=q_label, q_full=q_full,
+                seen={"in": bool(sess0)}):
             fresh = conn.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
             if not fresh:
                 return
-            text, color, extra = game_state(db._row_to_game(fresh))
+            text, color, extra, in_sess = game_state(db._row_to_game(fresh))
             chip.text = text
             chip.classes(replace=f"px-3 py-1 rounded-full text-sm font-medium {color}")
             sub.text = extra
             sub.visible = bool(extra)
+            q_label.text = "本次玩" if in_sess else "下次玩"
+            q_full.visible = not in_sess            # 游玩中不许放回上限
+            if in_sess != seen["in"]:
+                seen["in"] = in_sess                # 会话开/关 → 额度框的值与语义都变了
+                games_view.refresh()
         upd()
         _updaters.append(upd)
 
@@ -181,8 +230,9 @@ def game_card(g: db.Game):
         with ui.row().classes("w-full gap-2 items-end"):
             cd = ui.number("冷却(小时)", value=g.cooldown_hours, min=0, step=0.5) \
                 .classes("w-[92px]").props("dense")
-            sm = ui.number("单次(分钟)", value=g.session_minutes, min=0, step=5) \
-                .classes("w-[92px]").props("dense")
+            sm = ui.number("最长(分钟)", value=g.session_minutes, min=0, step=30) \
+                .classes("w-[92px]").props("dense") \
+                .tooltip("单次最长游玩时长（上限）；每次可在上面单独调低本次额度")
             if multi_windows:
                 # 多时段只能 CLI 设置；GUI 只读展示，避免下拉误覆盖丢数据
                 ui.label("时段 " + "、".join(g.windows) + "（多段，用 CLI 修改）") \
@@ -514,7 +564,7 @@ def stats_view():
 @ui.refreshable
 def history_view():
     rows = conn.execute(
-        """SELECT s.start_ts, s.end_ts, s.end_reason, g.name FROM sessions s
+        """SELECT s.start_ts, s.end_ts, s.end_reason, s.limit_minutes, g.name FROM sessions s
            JOIN games g ON g.id=s.game_id ORDER BY s.id DESC LIMIT 30""").fetchall()
     blocked = conn.execute(
         """SELECT e.ts, e.detail, g.name FROM events e JOIN games g ON g.id=e.game_id
@@ -527,7 +577,9 @@ def history_view():
         for r in rows:
             t0 = datetime.fromtimestamp(r["start_ts"]).strftime("%m-%d %H:%M")
             dur = f"{(r['end_ts'] - r['start_ts'])/60:.0f} 分钟" if r["end_ts"] else "进行中"
-            ui.label(f"{t0}  {r['name']}  玩了 {dur}（{reason_zh.get(r['end_reason'], r['end_reason'])}）") \
+            quota = f"，本次额度 {r['limit_minutes']:g} 分钟" if r["limit_minutes"] else ""
+            ui.label(f"{t0}  {r['name']}  玩了 {dur}"
+                     f"（{reason_zh.get(r['end_reason'], r['end_reason'])}{quota}）") \
                 .classes("text-sm text-slate-600")
         if blocked:
             ui.label("最近拦截").classes("text-sm font-bold text-slate-500 mt-2")

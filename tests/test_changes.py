@@ -69,4 +69,41 @@ g2 = db.upsert_game(conn, "无规则", "t2.exe")
 assert changes.request_delete(conn, g2) is None
 assert db.get_game(conn, "t2.exe") is None
 
+# ---- 本次游玩额度 ----
+g = db.upsert_game(conn, "额度", "q.exe", session_minutes=120)
+
+ok, _ = changes.set_next_session(conn, g, 60)                  # ≤上限 → 立即生效
+assert ok and db.get_game(conn, "q.exe").next_session_minutes == 60
+ok, msg = changes.set_next_session(conn, db.get_game(conn, "q.exe"), 180)
+assert not ok and "不能超过" in msg                             # 超上限 → 拒
+assert db.get_game(conn, "q.exe").next_session_minutes == 60   # 且不改动现值
+ok, _ = changes.set_next_session(conn, db.get_game(conn, "q.exe"), None)   # 清除
+assert ok and db.get_game(conn, "q.exe").next_session_minutes is None
+
+# 上限不限的游戏也能设额度（那也是收紧）
+g3 = db.upsert_game(conn, "无上限", "q3.exe")
+assert changes.set_next_session(conn, g3, 45)[0]
+assert db.get_game(conn, "q3.exe").next_session_minutes == 45
+
+# 额度在开会话时被消费（守护逻辑的 DB 面）
+g = db.get_game(conn, "q.exe")
+changes.set_next_session(conn, g, 90)
+now = time.time()
+sid = db.open_session(conn, g.id, int(now - 30 * 60), 90)      # 已玩 30 分钟
+db.set_next_session(conn, g.id, None)
+assert db.get_game(conn, "q.exe").next_session_minutes is None
+sess = db.active_session(conn, g.id)
+assert sess["id"] == sid and sess["limit_minutes"] == 90
+
+# 游玩中：只许缩短，且要留够预警缓冲
+g = db.get_game(conn, "q.exe")
+assert not changes.shorten_running_session(conn, g, sess, 120, now)[0]     # 加时 → 拒
+assert not changes.shorten_running_session(conn, g, sess, 90, now)[0]      # 不变 → 拒
+assert not changes.shorten_running_session(conn, g, sess, None, now)[0]    # 取消 → 拒
+ok, msg = changes.shorten_running_session(conn, g, sess, 35, now)          # 已玩30+预警10=40
+assert not ok and "最短可设 40" in msg, msg
+assert changes.shorten_running_session(conn, g, sess, 60, now)[0]
+assert db.active_session(conn, g.id)["limit_minutes"] == 60
+db.close_session(conn, sid, int(now), "self_exit")
+
 print("test_changes: 全部通过")

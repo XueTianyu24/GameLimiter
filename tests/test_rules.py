@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gamelimiter.db import Game
-from gamelimiter.rules import check_start, current_window_end, next_window_start, session_deadline
+from gamelimiter.rules import (check_start, current_window_end, effective_limit,
+                               next_window_start, session_deadline)
 
 
 def g(cooldown=None, session=None, windows=None):
@@ -65,5 +66,26 @@ assert dl == (now, "window_end"), dl
 
 # 无 b/c 规则 → 无 deadline
 assert session_deadline(g(cooldown=4), int(ts("2026-07-23 19:00")), ts("2026-07-23 19:30")) is None
+
+# 本次额度与上限取更严者
+assert effective_limit(120, 60) == 60        # 额度更短 → 用额度
+assert effective_limit(120, 180) == 120      # 额度超上限（不该发生）→ 上限兜底
+assert effective_limit(120, None) == 120     # 没设额度 → 用满上限
+assert effective_limit(None, 60) == 60       # 上限不限时额度照样生效
+assert effective_limit(None, None) is None
+assert effective_limit(120, 0) == 120        # 0 视同未设
+
+# deadline：本次额度 60 分钟压过 120 上限
+start = int(ts("2026-07-23 19:00"))
+dl = session_deadline(g(session=120), start, ts("2026-07-23 19:30"), 60)
+assert dl == (ts("2026-07-23 20:00"), "session_timeout"), dl
+# 额度与时段仍取最早
+dl = session_deadline(g(session=300, windows=w), start, ts("2026-07-23 19:30"), 60)
+assert dl == (ts("2026-07-23 20:00"), "session_timeout"), dl
+dl = session_deadline(g(session=300, windows=["19:00-19:30"]), start, ts("2026-07-23 19:10"), 60)
+assert dl == (ts("2026-07-23 19:30"), "window_end"), dl
+# 上限不限、只给额度
+dl = session_deadline(g(), start, ts("2026-07-23 19:10"), 45)
+assert dl == (ts("2026-07-23 19:45"), "session_timeout"), dl
 
 print("test_rules: 全部通过")
