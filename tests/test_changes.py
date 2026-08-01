@@ -93,7 +93,8 @@ assert db.get_game(conn, "q3.exe").next_session_minutes == 45
 g = db.get_game(conn, "q.exe")
 changes.set_next_session(conn, g, 90)
 now = time.time()
-sid = db.open_session(conn, g.id, int(now - 30 * 60), 90)      # 已玩 30 分钟
+sid = db.open_session(conn, g.id, int(now - 30 * 60), 90)
+db.heartbeat(conn, sid, 30 * 60, now)   # 已玩 30 分钟——按心跳算，不是按 start_ts 的墙钟差
 db.set_next_session(conn, g.id, None)
 assert db.get_game(conn, "q.exe").next_session_minutes is None
 sess = db.active_session(conn, g.id)

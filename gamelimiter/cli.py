@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-from . import changes, db, rules
+from . import changes, config, db, rules
 
 
 def _num_or_off(s):
@@ -104,10 +104,17 @@ def cmd_next(conn, a):
     sess = db.active_session(conn, g.id)
     if a.minutes is None:
         cap = f"{g.session_minutes:g} 分钟" if g.session_minutes else "不限"
+        block = db.current_block(conn, g.id)
         if sess:
             cur = rules.effective_limit(g.session_minutes, sess["limit_minutes"])
             print(f"{g.name} 游玩中：本次 {f'{cur:g} 分钟' if cur else '不限'}"
-                  f"（已玩 {(time.time() - sess['start_ts'])/60:.0f} 分钟，上限 {cap}）")
+                  f"（本段已玩 {block['played_seconds']/60:.0f} 分钟，上限 {cap}）")
+        elif rules.block_alive(block, g.session_minutes, time.time(), config.IDLE_GRACE_MINUTES):
+            left = rules.block_remaining(g.session_minutes, block)
+            idle_left = config.IDLE_GRACE_MINUTES - (time.time() - block["last_end_ts"]) / 60
+            print(f"{g.name}：上一段没玩完——已玩 {block['played_seconds']/60:.0f} 分钟，"
+                  f"还剩 {f'{left/60:.0f} 分钟' if left else '不限'}；"
+                  f"{idle_left:.0f} 分钟内再打开算接着玩（不查冷却）")
         else:
             print(f"{g.name}：下次额度 "
                   f"{f'{g.next_session_minutes:g} 分钟' if g.next_session_minutes else '（未设，按上限）'}"
@@ -164,10 +171,10 @@ def cmd_history(conn, a):
         """SELECT s.*, g.name FROM sessions s JOIN games g ON g.id=s.game_id
            ORDER BY s.id DESC LIMIT ?""", (a.limit,)).fetchall()
     for r in rows:
-        dur = f"{(r['end_ts'] - r['start_ts'])/60:.1f}min" if r["end_ts"] else "进行中"
+        dur = f"{db.session_played(r)/60:.1f}min" if r["end_ts"] else "进行中"
         quota = f"  [额度 {r['limit_minutes']:g}min]" if r["limit_minutes"] else ""
         print(f"{r['name']}  {_fmt_ts(r['start_ts'])} → {_fmt_ts(r['end_ts'])}"
-              f"  {dur}  {r['end_reason'] or ''}{quota}")
+              f"  {dur}  段{db.block_of(r)}  {r['end_reason'] or ''}{quota}")
     rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (a.limit,)).fetchall()
     print("--- 事件 ---")
     for r in rows:

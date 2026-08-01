@@ -10,9 +10,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gamelimiter.db import Game
-from gamelimiter.rules import (check_daily_limit, check_start, current_window_end, day_bounds,
-                               effective_limit, next_window_start, session_deadline,
-                               unlock_datetime)
+from gamelimiter.rules import (block_alive, block_remaining, check_daily_limit, check_start,
+                               current_window_end, day_bounds, effective_limit,
+                               next_window_start, session_deadline, unlock_datetime)
+
+
+def blk(played_min=0.0, limit=None, last_end=None, running=False):
+    """伪造一段游玩（block）的聚合，字段与 db.current_block 一致。"""
+    return {"block_id": 1, "played_seconds": played_min * 60, "limit_minutes": limit,
+            "last_end_ts": last_end, "running": running, "sessions": 1}
 
 
 def g(cooldown=None, session=None, windows=None, until=None):
@@ -53,21 +59,25 @@ assert current_window_end(w2, datetime.fromisoformat("2026-07-23 00:30")) \
 v = check_start(g(cooldown=4, windows=w), int(ts("2026-07-23 18:00")), ts("2026-07-23 19:30"))
 assert not v.allowed and v.reason == "cooldown"
 
-# deadline：单次时长
-dl = session_deadline(g(session=90), int(ts("2026-07-23 19:00")), ts("2026-07-23 19:30"))
+# deadline：单次时长（已玩 30 分钟 → 还剩 60，20:30 到点）
+dl = session_deadline(g(session=90), ts("2026-07-23 19:30"), 30 * 60)
 assert dl == (ts("2026-07-23 20:30"), "session_timeout"), dl
 
 # deadline：时长 vs 时段取最早
-dl = session_deadline(g(session=300, windows=w), int(ts("2026-07-23 19:00")), ts("2026-07-23 19:30"))
+dl = session_deadline(g(session=300, windows=w), ts("2026-07-23 19:30"), 30 * 60)
 assert dl == (ts("2026-07-23 23:00"), "window_end"), dl
 
 # deadline：会话中途时段已结束（规则收紧）→ 立即到点
 now = ts("2026-07-23 23:30")
-dl = session_deadline(g(windows=w), int(ts("2026-07-23 19:00")), now)
+dl = session_deadline(g(windows=w), now, 4.5 * 3600)
 assert dl == (now, "window_end"), dl
 
 # 无 b/c 规则 → 无 deadline
-assert session_deadline(g(cooldown=4), int(ts("2026-07-23 19:00")), ts("2026-07-23 19:30")) is None
+assert session_deadline(g(cooldown=4), ts("2026-07-23 19:30"), 30 * 60) is None
+
+# deadline 按**真实游玩**算：中途关掉游戏歇了 2 小时，剩余额度不受墙钟影响
+dl = session_deadline(g(session=90), ts("2026-07-23 21:30"), 30 * 60)
+assert dl == (ts("2026-07-23 22:30"), "session_timeout"), dl   # 仍是"还剩 60 分钟"
 
 # 本次额度与上限取更严者
 assert effective_limit(120, 60) == 60        # 额度更短 → 用额度
@@ -78,17 +88,56 @@ assert effective_limit(None, None) is None
 assert effective_limit(120, 0) == 120        # 0 视同未设
 
 # deadline：本次额度 60 分钟压过 120 上限
-start = int(ts("2026-07-23 19:00"))
-dl = session_deadline(g(session=120), start, ts("2026-07-23 19:30"), 60)
+dl = session_deadline(g(session=120), ts("2026-07-23 19:30"), 30 * 60, 60)
 assert dl == (ts("2026-07-23 20:00"), "session_timeout"), dl
 # 额度与时段仍取最早
-dl = session_deadline(g(session=300, windows=w), start, ts("2026-07-23 19:30"), 60)
+dl = session_deadline(g(session=300, windows=w), ts("2026-07-23 19:30"), 30 * 60, 60)
 assert dl == (ts("2026-07-23 20:00"), "session_timeout"), dl
-dl = session_deadline(g(session=300, windows=["19:00-19:30"]), start, ts("2026-07-23 19:10"), 60)
+dl = session_deadline(g(session=300, windows=["19:00-19:30"]), ts("2026-07-23 19:10"), 10 * 60, 60)
 assert dl == (ts("2026-07-23 19:30"), "window_end"), dl
 # 上限不限、只给额度
-dl = session_deadline(g(), start, ts("2026-07-23 19:10"), 45)
+dl = session_deadline(g(), ts("2026-07-23 19:10"), 10 * 60, 45)
 assert dl == (ts("2026-07-23 19:45"), "session_timeout"), dl
+
+# ---- 一段游玩（block）：额度按真实在跑时间消耗，提前退出保留剩余 ----
+GRACE = 60.0
+t_exit = ts("2026-08-01 18:07")
+
+# 还在玩 → 这一段当然活着
+assert block_alive(blk(running=True), 60, ts("2026-08-01 18:30"), GRACE)
+# 玩了 31.5 分钟就退出（上限 60）→ 47 分钟后回来仍算同一段
+assert block_alive(blk(31.5, last_end=t_exit), 60, ts("2026-08-01 18:54"), GRACE)
+# 空闲超过 60 分钟 → 这一段作废
+assert not block_alive(blk(31.5, last_end=t_exit), 60, ts("2026-08-01 19:08"), GRACE)
+# 额度已用满 → 立刻算结束，哪怕刚退出
+assert not block_alive(blk(60, last_end=t_exit), 60, ts("2026-08-01 18:08"), GRACE)
+assert not block_alive(blk(75, last_end=t_exit), 60, ts("2026-08-01 18:08"), GRACE)
+# 本次额度比上限更严 → 按额度判耗尽
+assert not block_alive(blk(30, limit=30, last_end=t_exit), 60, ts("2026-08-01 18:08"), GRACE)
+assert block_alive(blk(20, limit=30, last_end=t_exit), 60, ts("2026-08-01 18:08"), GRACE)
+# 不限时长 → 只受空闲窗口约束
+assert block_alive(blk(300, last_end=t_exit), None, ts("2026-08-01 18:30"), GRACE)
+assert not block_alive(blk(300, last_end=t_exit), None, ts("2026-08-01 19:30"), GRACE)
+assert not block_alive(None, 60, ts("2026-08-01 18:30"), GRACE)          # 从没玩过
+
+# 剩余额度
+assert block_remaining(60, blk(31.5)) == 28.5 * 60
+assert block_remaining(60, blk(75)) == 0                                 # 超了不给负数
+assert block_remaining(None, blk(31.5)) is None                          # 不限时长
+assert block_remaining(60, None) == 60 * 60                              # 还没开始玩
+assert block_remaining(60, blk(20, limit=30)) == 10 * 60                 # 额度更严
+
+# 续玩跳过冷却，但可玩日与时段照查（硬边界）
+v = check_start(g(cooldown=20), int(t_exit), ts("2026-08-01 18:54"))
+assert not v.allowed and v.reason == "cooldown", v                       # 不续玩 → 冷却挡住
+v = check_start(g(cooldown=20), int(t_exit), ts("2026-08-01 18:54"), resuming=True)
+assert v.allowed, v                                                      # 续玩 → 放行
+v = check_start(g(cooldown=20, windows=["06:00-22:00"]), int(t_exit),
+                ts("2026-08-01 22:30"), resuming=True)
+assert not v.allowed and v.reason == "outside_window", v                 # 时段仍是硬边界
+v = check_start(g(cooldown=20, until="2026-08-05"), int(t_exit),
+                ts("2026-08-01 18:54"), resuming=True)
+assert not v.allowed and v.reason == "locked_until_date", v              # 可玩日仍是硬边界
 
 # 规则 a 第二道门：下次可玩日
 mon = ts("2026-07-26 20:00")                                   # 参照“今天”

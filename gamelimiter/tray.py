@@ -108,7 +108,9 @@ def _playing_text(conn) -> str:
         g = games.get(row["game_id"])
         if not g:
             continue
-        dl = rules.session_deadline(g, row["start_ts"], now, row["limit_minutes"])
+        block = db.current_block(conn, g.id)
+        dl = rules.session_deadline(g, now, block["played_seconds"] if block else 0.0,
+                                    row["limit_minutes"])
         return (f"{g.name} 剩 {max(0, (dl[0] - now) / 60):.0f} 分钟" if dl
                 else f"{g.name} 游玩中")
     return ""

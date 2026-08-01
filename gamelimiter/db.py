@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     start_ts INTEGER NOT NULL,
     end_ts INTEGER,
     end_reason TEXT,          -- self_exit / session_timeout / window_end / disabled / daemon_restart
-    limit_minutes REAL        -- 本次生效额度快照，NULL=用满上限；进行中只可改小
+    limit_minutes REAL,       -- 本次生效额度快照，NULL=用满上限；进行中只可改小
+    block_id INTEGER,         -- 所属游玩段（= 该段首个 session 的 id）；同段内续玩共享额度
+    played_seconds REAL,      -- 守护心跳累计的**真实**在跑秒数（空窗期不计），NULL=老数据
+    last_seen_ts INTEGER      -- 最后一次观测到进程存活的时刻；会话结束时间取它
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +82,10 @@ class Game:
 _MIGRATIONS = [("games", "icon", "TEXT"),
                ("games", "next_session_minutes", "REAL"),
                ("games", "next_allowed_date", "TEXT"),
-               ("sessions", "limit_minutes", "REAL")]
+               ("sessions", "limit_minutes", "REAL"),
+               ("sessions", "block_id", "INTEGER"),
+               ("sessions", "played_seconds", "REAL"),
+               ("sessions", "last_seen_ts", "INTEGER")]
 
 
 def _migrate(conn):
@@ -183,11 +189,27 @@ def remove_game(conn, game_id: int):
 # ---- 会话 ----
 
 def open_session(conn, game_id: int, start_ts: int,
-                 limit_minutes: Optional[float] = None) -> int:
-    cur = conn.execute("INSERT INTO sessions (game_id, start_ts, limit_minutes) VALUES (?,?,?)",
-                       (game_id, start_ts, limit_minutes))
+                 limit_minutes: Optional[float] = None,
+                 block_id: Optional[int] = None) -> int:
+    """开一次会话。`block_id=None` = 开新的一段游玩（自己当段首）；
+    给了值 = 接着那一段玩（额度继续消耗，不重新发）。"""
+    cur = conn.execute(
+        """INSERT INTO sessions (game_id, start_ts, limit_minutes, block_id,
+                                 played_seconds, last_seen_ts)
+           VALUES (?,?,?,?,0,?)""",
+        (game_id, start_ts, limit_minutes, block_id, start_ts))
+    sid = cur.lastrowid
+    if block_id is None:
+        conn.execute("UPDATE sessions SET block_id=? WHERE id=?", (sid, sid))
     conn.commit()
-    return cur.lastrowid
+    return sid
+
+
+def heartbeat(conn, session_id: int, played_seconds: float, last_seen_ts: float):
+    """守护每轮落库：本次会话累计的真实在跑秒数 + 最后一次看到进程的时刻。"""
+    conn.execute("UPDATE sessions SET played_seconds=?, last_seen_ts=? WHERE id=?",
+                 (played_seconds, int(last_seen_ts), session_id))
+    conn.commit()
 
 
 def set_session_limit(conn, session_id: int, minutes: Optional[float]):
@@ -213,6 +235,51 @@ def active_session(conn, game_id: int) -> Optional[sqlite3.Row]:
 def last_session_end(conn, game_id: int) -> Optional[int]:
     r = conn.execute("SELECT MAX(end_ts) AS m FROM sessions WHERE game_id=?", (game_id,)).fetchone()
     return r["m"]
+
+
+# ---- 游玩段（block）：连续几次开关游戏算同一段，共享一份额度 ----
+
+def session_played(r: sqlite3.Row) -> float:
+    """一条会话行的真实游玩秒数。老数据没有心跳 → 退回墙钟差（那时也没别的可信来源）。"""
+    if r["played_seconds"] is not None:
+        return max(0.0, r["played_seconds"])
+    return max(0.0, (r["end_ts"] - r["start_ts"])) if r["end_ts"] else 0.0
+
+
+def block_of(r: sqlite3.Row) -> int:
+    """会话所属段 id；老数据没有 block_id，各自成段。"""
+    return r["block_id"] if r["block_id"] is not None else r["id"]
+
+
+def last_session(conn, game_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sessions WHERE game_id=? ORDER BY start_ts DESC, id DESC LIMIT 1",
+        (game_id,)).fetchone()
+
+
+def block_rows(conn, block_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sessions WHERE COALESCE(block_id, id)=? ORDER BY id", (block_id,)).fetchall()
+
+
+def current_block(conn, game_id: int) -> Optional[dict]:
+    """该游戏最近一段游玩的聚合。从没玩过 → None。
+
+    `limit_minutes` 取段内各会话额度的最小值——额度只可能被改小，取 min 即当前生效值。
+    """
+    last = last_session(conn, game_id)
+    if not last:
+        return None
+    rows = block_rows(conn, block_of(last))
+    limits = [r["limit_minutes"] for r in rows if r["limit_minutes"] is not None]
+    return {
+        "block_id": block_of(last),
+        "played_seconds": sum(session_played(r) for r in rows),
+        "limit_minutes": min(limits) if limits else None,
+        "last_end_ts": last["end_ts"],          # None = 这一刻还在玩
+        "running": last["end_ts"] is None,
+        "sessions": len(rows),
+    }
 
 
 # ---- 全局设置 ----

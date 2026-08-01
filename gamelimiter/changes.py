@@ -130,7 +130,8 @@ def shorten_running_session(conn, g: db.Game, sess, minutes,
                             now: Optional[float] = None) -> tuple[bool, str]:
     """改进行中会话的额度：**只许缩短**——玩到一半想加时正是要拦的冲动。
 
-    下限 = 已玩 + 最长预警档：缩短后仍要收得到预警，PVP 被无预警强杀会判逃跑。
+    下限 = 本段已玩 + 最长预警档：缩短后仍要收得到预警，PVP 被无预警强杀会判逃跑。
+    已玩按这一段的累计真实游玩时间算（含之前退出过的几次），不是当前会话的墙钟。
     """
     now = now or time.time()
     minutes = float(minutes) if minutes else None
@@ -139,10 +140,11 @@ def shorten_running_session(conn, g: db.Game, sess, minutes,
     cur = rules.effective_limit(g.session_minutes, sess["limit_minutes"])
     if cur and minutes >= cur:
         return False, f"游玩中只能缩短本次时长（当前 {cur:g} 分钟），不能加时"
-    played = (now - sess["start_ts"]) / 60
+    block = db.current_block(conn, g.id)
+    played = (block["played_seconds"] if block else 0.0) / 60
     buffer = max(config.WARN_MINUTES)
     if minutes < played + buffer:
-        return False, (f"本次已玩 {played:.0f} 分钟，需留 {buffer:g} 分钟预警缓冲，"
+        return False, (f"本段已玩 {played:.0f} 分钟，需留 {buffer:g} 分钟预警缓冲，"
                        f"最短可设 {played + buffer:.0f} 分钟")
     db.set_session_limit(conn, sess["id"], minutes)
     db.log_event(conn, g.id, "quota", f"session={minutes:g}min")

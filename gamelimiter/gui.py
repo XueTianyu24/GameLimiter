@@ -33,12 +33,15 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
     """返回 (chip文本, chip颜色类, 副注, 是否游玩中)。颜色类 = tailwind bg/text。"""
     now = time.time()
     sess = db.active_session(conn, g.id)
+    block = db.current_block(conn, g.id)
     if not g.enabled:
         return "已停用（不受限制）", "bg-gray-100 text-gray-500", "", bool(sess)
     if sess:
-        dl = rules.session_deadline(g, sess["start_ts"], now, sess["limit_minutes"])
-        played = (now - sess["start_ts"]) / 60
-        note = f"本次已玩 {played:.0f} 分钟"
+        played = block["played_seconds"] if block else 0.0
+        dl = rules.session_deadline(g, now, played, sess["limit_minutes"])
+        note = f"本段已玩 {played/60:.0f} 分钟"
+        if block and block["sessions"] > 1:
+            note += f"（分 {block['sessions']} 次）"
         if sess["limit_minutes"]:
             note += f" · 本次额度 {sess['limit_minutes']:g} 分钟"
         if dl:
@@ -47,8 +50,18 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
             return (f"游玩中 · {t} 强制结束（剩 {left:.0f} 分钟）",
                     "bg-blue-100 text-blue-700", note, True)
         return "游玩中 · 无时长限制", "bg-blue-100 text-blue-700", note, True
-    v = rules.check_start(g, db.last_session_end(conn, g.id), now)
+
+    # 上一段还没玩完 → 现在再打开是"接着玩"，用剩下的额度，不查冷却
+    resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
+    v = rules.check_start(g, db.last_session_end(conn, g.id), now, resuming=resuming)
     cap_txt = f"单次最长 {g.session_minutes:g} 分钟" if g.session_minutes else "单次时长不限"
+    if v.allowed and resuming:
+        left = rules.block_remaining(g.session_minutes, block)
+        idle_left = config.IDLE_GRACE_MINUTES - (now - block["last_end_ts"]) / 60
+        note = (f"本段已玩 {block['played_seconds']/60:.0f} 分钟"
+                f"，{idle_left:.0f} 分钟内再打开算同一段（之后这段作废、进入冷却）")
+        return (f"可接着玩 · 本段还剩 {left/60:.0f} 分钟" if left else "可接着玩 · 无时长限制",
+                "bg-teal-100 text-teal-700", note, False)
     if v.allowed:
         extra = (f"下次限 {g.next_session_minutes:g} 分钟（{cap_txt}）"
                  if g.next_session_minutes else
@@ -684,7 +697,7 @@ def stats_view():
 @ui.refreshable
 def history_view():
     rows = conn.execute(
-        """SELECT s.start_ts, s.end_ts, s.end_reason, s.limit_minutes, g.name FROM sessions s
+        """SELECT s.*, g.name FROM sessions s
            JOIN games g ON g.id=s.game_id ORDER BY s.id DESC LIMIT 30""").fetchall()
     blocked = conn.execute(
         """SELECT e.ts, e.detail, g.name FROM events e JOIN games g ON g.id=e.game_id
@@ -694,13 +707,17 @@ def history_view():
     with ui.column().classes("w-full gap-1"):
         if not rows and not blocked:
             ui.label("暂无记录").classes("text-slate-400")
+        prev_block = None
         for r in rows:
             t0 = datetime.fromtimestamp(r["start_ts"]).strftime("%m-%d %H:%M")
-            dur = f"{(r['end_ts'] - r['start_ts'])/60:.0f} 分钟" if r["end_ts"] else "进行中"
+            dur = f"{db.session_played(r)/60:.0f} 分钟" if r["end_ts"] else "进行中"
             quota = f"，本次额度 {r['limit_minutes']:g} 分钟" if r["limit_minutes"] else ""
-            ui.label(f"{t0}  {r['name']}  玩了 {dur}"
+            # 同一段游玩里的第 2 次起标出来，免得看着像"冷却没生效又开了一把"
+            same = db.block_of(r) == prev_block
+            prev_block = db.block_of(r)
+            ui.label(f"{'└ 接着玩  ' if same else ''}{t0}  {r['name']}  玩了 {dur}"
                      f"（{reason_zh.get(r['end_reason'], r['end_reason'])}{quota}）") \
-                .classes("text-sm text-slate-600")
+                .classes("text-sm " + ("text-slate-400 pl-3" if same else "text-slate-600"))
         if blocked:
             ui.label("最近拦截").classes("text-sm font-bold text-slate-500 mt-2")
             for r in blocked:

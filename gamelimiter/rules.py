@@ -1,15 +1,19 @@
 """三规则引擎：纯函数，不碰 DB / 进程。
 
-(a) cooldown_hours     间隔冷却：now >= 上次会话结束 + N 小时 才允许启动
+(a) cooldown_hours     间隔冷却：now >= 上一段游玩结束 + N 小时 才允许启动
     next_allowed_date  下次可玩日：那天（的第一个允许时段）之前一律打不开。两道门独立
                        叠加——冷却管"同一天别连着再来"，日期管跨天规划
-(b) session_minutes  单次最长时长（上限）：deadline = 会话开始 + N 分钟
+(b) session_minutes  单次最长时长（上限）：一段游玩累计**真实在跑**多少分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
 (d) daily_game_limit **全局**：一天内最多玩几款不同的游戏（不挂在单个游戏上）
 a/b/c 三条按游戏配置、可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
 
 规则 b 是**上限**：每次会话可另给一个"本次额度"（`limit_minutes`），与上限取更严者。
 额度只能收紧不能放宽——这是防冲动的核心，见 `changes.set_next_session`。
+
+**一段游玩（block）**：额度按进程真实在跑的时间消耗，中途退出即暂停、剩余保留；
+退出后 `IDLE_GRACE_MINUTES` 内再打开算接着玩同一段（额度接着用、不查冷却）。
+额度耗尽或空闲超时 → 这一段结束，冷却才从最后退出时刻起算。见 `block_alive`。
 """
 
 from dataclasses import dataclass
@@ -98,8 +102,14 @@ def unlock_datetime(date_str: str, windows: Optional[list]) -> datetime:
     return day0
 
 
-def check_start(game: Game, last_end_ts: Optional[int], now_ts: float) -> StartVerdict:
-    """启动前检查：下次可玩日 + 冷却 + 时段。"""
+def check_start(game: Game, last_end_ts: Optional[int], now_ts: float,
+                resuming: bool = False) -> StartVerdict:
+    """启动前检查：下次可玩日 + 冷却 + 时段。
+
+    `resuming=True` = 接着上一段没玩完的额度继续玩（见 `block_alive`）→ **跳过冷却**。
+    冷却管的是"两段游玩之间隔多久"，中途去吃个饭再回来不该被它咬。
+    可玩日与时段是硬边界，续玩照查——22:00 到点就是不许再开。
+    """
     now = datetime.fromtimestamp(now_ts)
 
     # 规则 a 第一道门：锁到某天（跨天规划）。过期即失效，不用手动清
@@ -112,7 +122,7 @@ def check_start(game: Game, last_end_ts: Optional[int], now_ts: float) -> StartV
                                 f"{unlock.strftime('%H:%M')}，在那之前打不开",
                                 unlock.timestamp())
 
-    if game.cooldown_hours and last_end_ts:
+    if game.cooldown_hours and last_end_ts and not resuming:
         unlock = last_end_ts + game.cooldown_hours * 3600
         if now_ts < unlock:
             t = datetime.fromtimestamp(unlock).strftime("%m-%d %H:%M")
@@ -141,17 +151,44 @@ def effective_limit(cap: Optional[float], chosen: Optional[float]) -> Optional[f
     return min(vals) if vals else None
 
 
-def session_deadline(game: Game, start_ts: int, now_ts: float,
+def block_alive(block: Optional[dict], cap_minutes: Optional[float], now_ts: float,
+                idle_grace_minutes: float) -> bool:
+    """这一段游玩是否还活着——即"再打开就是接着玩"，而不是开新的一场。
+
+    活着的条件：还在玩，或者（额度没用完 且 退出还没超过 `idle_grace_minutes`）。
+    额度耗尽 / 空闲太久 → 这一段结束，冷却从最后退出时刻起算。
+    """
+    if not block:
+        return False
+    if block["running"]:
+        return True
+    limit = effective_limit(cap_minutes, block["limit_minutes"])
+    if limit and block["played_seconds"] >= limit * 60:
+        return False
+    return now_ts - block["last_end_ts"] <= idle_grace_minutes * 60
+
+
+def block_remaining(cap_minutes: Optional[float], block: Optional[dict]) -> Optional[float]:
+    """这一段还剩多少秒额度；不限时长返回 None，用尽返回 0。"""
+    limit = effective_limit(cap_minutes, block["limit_minutes"] if block else None)
+    if not limit:
+        return None
+    return max(0.0, limit * 60 - (block["played_seconds"] if block else 0.0))
+
+
+def session_deadline(game: Game, now_ts: float, played_seconds: float = 0.0,
                      limit_minutes: Optional[float] = None) -> Optional[tuple[float, str]]:
     """运行中会话的最早强制截止 (deadline_ts, reason)；无 b/c 规则返回 None。
 
-    `limit_minutes` = 本次会话额度（会话行快照），与游戏上限取更严者。
+    时长按**这一段累计的真实游玩秒数** `played_seconds` 算剩余，不按会话开始的墙钟——
+    中途退出的时间不该被计入，守护没观测到的空窗期也不该（见 `config.HEARTBEAT_MAX_GAP`）。
+    `limit_minutes` = 本段额度，与游戏上限取更严者。
     时段规则：若 now 已在时段外（时段中途结束/规则收紧），deadline=now 立即到点。
     """
     cands: list[tuple[float, str]] = []
     limit = effective_limit(game.session_minutes, limit_minutes)
     if limit:
-        cands.append((start_ts + limit * 60, "session_timeout"))
+        cands.append((now_ts + limit * 60 - played_seconds, "session_timeout"))
     if game.windows:
         end = current_window_end(game.windows, datetime.fromtimestamp(now_ts))
         cands.append((end.timestamp(), "window_end") if end else (now_ts, "window_end"))

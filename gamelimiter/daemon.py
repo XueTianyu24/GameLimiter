@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +18,7 @@ from typing import Optional
 
 import psutil
 
-from . import changes, db, rules
+from . import changes, config, db, rules
 from .config import LOG_PATH, POLL_INTERVAL, RULE_RELOAD_INTERVAL, WARN_MINUTES
 from .notifier import popup
 from .winutil import DAEMON_MUTEX, WATCHDOG_MUTEX, hold_mutex, mutex_exists, spawn_detached
@@ -29,13 +30,17 @@ def _setup_logging():
     """日志进数据目录；无写权限（SYSTEM 先建了 log 的机器上用户身份跑）时
     退回 LOCALAPPDATA——守护崩死 = 完全没限制，比日志分裂严重得多。"""
     fallback = None
+    # 轮转：SYSTEM 计划任务每分钟拉一次守护做自愈，日志只涨不消，实测三天 780KB
+    def _handler(path):
+        return RotatingFileHandler(path, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+
     try:
-        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        fh = _handler(LOG_PATH)
     except PermissionError:
         alt_dir = Path(os.environ.get("LOCALAPPDATA", ".")) / "GameLimiter"
         alt_dir.mkdir(parents=True, exist_ok=True)
         fallback = alt_dir / "daemon.log"
-        fh = logging.FileHandler(fallback, encoding="utf-8")
+        fh = _handler(fallback)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -51,8 +56,17 @@ class ActiveSession:
     session_id: int
     game_id: int
     start_ts: int
-    limit_minutes: Optional[float] = None      # 本次额度（≤上限），None=用满上限
+    limit_minutes: Optional[float] = None      # 本段额度（≤上限），None=用满上限
+    block_id: Optional[int] = None             # 所属游玩段
+    carried_seconds: float = 0.0               # 本段之前几次已用掉的游玩秒数
+    played_seconds: float = 0.0                # 本次会话累计的真实在跑秒数
+    last_seen_ts: float = 0.0                  # 最后一次观测到进程存活的时刻
     warned: set = field(default_factory=set)   # 已触发的预警分钟档
+
+    @property
+    def block_played(self) -> float:
+        """本段累计真实游玩秒数（含之前几次）。"""
+        return self.carried_seconds + self.played_seconds
 
 
 def _fmt(ts: float) -> str:
@@ -126,26 +140,44 @@ class Daemon:
     # ---- 启动时收养/清理遗留会话 ----
 
     def adopt_sessions(self):
+        """守护重启后接管遗留会话。
+
+        进程没了的：结束时间取 `last_seen_ts`（最后一次确认它还活着的时刻），
+        **不是现在**——守护没跑的那段时间不该算成游玩，也不该推后冷却起算点。
+        """
+        now = time.time()
         all_games = {g.id: g for g in db.list_games(self.conn)}
         procs = _scan_procs({g.exe_name.lower() for g in all_games.values()})
         for row in db.open_sessions(self.conn):
             g = all_games.get(row["game_id"])
             alive = g and procs.get(g.exe_name.lower())
             if alive:
-                self.active[g.id] = ActiveSession(row["id"], g.id, row["start_ts"],
-                                                  row["limit_minutes"])
+                siblings = [r for r in db.block_rows(self.conn, db.block_of(row))
+                            if r["id"] != row["id"]]
+                self.active[g.id] = ActiveSession(
+                    row["id"], g.id, row["start_ts"], row["limit_minutes"],
+                    block_id=db.block_of(row),
+                    carried_seconds=sum(db.session_played(r) for r in siblings),
+                    played_seconds=row["played_seconds"] or 0.0,
+                    last_seen_ts=now)          # 空窗期不补计，从现在重新开始心跳
                 log.info(f"收养进行中会话：{g.name}（开始于 {_fmt(row['start_ts'])}）")
             else:
-                db.close_session(self.conn, row["id"], int(time.time()), "daemon_restart")
+                db.close_session(self.conn, row["id"],
+                                 int(row["last_seen_ts"] or row["start_ts"]), "daemon_restart")
 
     # ---- 每轮处理 ----
 
     def _handle_start_attempt(self, g: db.Game, procs: list[psutil.Process], now: float):
+        # 上一段游玩还活着？活着 = 接着玩（额度接着用、跳过冷却），不是开新的一场
+        block = db.current_block(self.conn, g.id)
+        resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
+
         # 全局款数上限先判：它挡的是"今天又开一款新的"，比冷却/时段更能说明问题
         today = db.games_played_between(self.conn, *rules.day_bounds(now))
         verdict = rules.check_daily_limit(self.daily_limit, today, g.id, now)
         if verdict.allowed:
-            verdict = rules.check_start(g, db.last_session_end(self.conn, g.id), now)
+            verdict = rules.check_start(g, db.last_session_end(self.conn, g.id), now,
+                                        resuming=resuming)
         if not verdict.allowed:
             n = _kill(procs)
             db.log_event(self.conn, g.id, "blocked", f"{verdict.reason}: {verdict.detail}")
@@ -153,31 +185,59 @@ class Daemon:
             popup(f"GameLimiter — {g.name} 已被拦截", verdict.detail)
             return
 
-        # 本次额度：开会话即消费掉（含内存里的 games 缓存，否则秒退再进会重复用）
-        quota = g.next_session_minutes
-        sid = db.open_session(self.conn, g.id, int(now), quota)
-        if quota is not None:
-            db.set_next_session(self.conn, g.id, None)
-            g.next_session_minutes = None
-        self.active[g.id] = ActiveSession(sid, g.id, int(now), quota)
-        dl = rules.session_deadline(g, int(now), now, quota)
-        log.info(f"会话开始：{g.name}" + (f"（本次额度 {quota:g} 分钟）" if quota else "")
+        if resuming:
+            block_id, quota = block["block_id"], block["limit_minutes"]
+            carried = block["played_seconds"]
+        else:
+            # 新的一段：此刻才消费本次额度（含内存里的 games 缓存，否则秒退再进会重复用）
+            block_id, quota, carried = None, g.next_session_minutes, 0.0
+            if quota is not None:
+                db.set_next_session(self.conn, g.id, None)
+                g.next_session_minutes = None
+        sid = db.open_session(self.conn, g.id, int(now), quota, block_id)
+        sess = ActiveSession(sid, g.id, int(now), quota,
+                             block_id=block_id or sid, carried_seconds=carried,
+                             last_seen_ts=now)
+        self.active[g.id] = sess
+        dl = rules.session_deadline(g, now, carried, quota)
+        head = "接着上一段玩" if resuming else "会话开始"
+        log.info(f"{head}：{g.name}" + (f"（本段额度 {quota:g} 分钟）" if quota else "")
+                 + (f"，已玩 {carried/60:.1f} 分钟" if carried else "")
                  + (f"，截止 {_fmt(dl[0])}（{dl[1]}）" if dl else ""))
         if dl:
-            quota_note = f"本次额度 {quota:g} 分钟；" if quota else ""
-            popup(f"GameLimiter — {g.name}",
-                  f"{quota_note}本次会话已开始，最晚 {_fmt(dl[0])[:5]} 结束"
-                  f"（{rules.REASON_TEXT[dl[1]]}前会提前预警）", warn=False)
+            if resuming:
+                left = max(0.0, (dl[0] - now) / 60)
+                popup(f"GameLimiter — {g.name}",
+                      f"接着上一段玩：本段已玩 {carried/60:.0f} 分钟，还剩 {left:.0f} 分钟，"
+                      f"最晚 {_fmt(dl[0])[:5]} 结束", warn=False)
+            else:
+                quota_note = f"本次额度 {quota:g} 分钟；" if quota else ""
+                popup(f"GameLimiter — {g.name}",
+                      f"{quota_note}本次会话已开始，最晚 {_fmt(dl[0])[:5]} 结束"
+                      f"（{rules.REASON_TEXT[dl[1]]}前会提前预警）", warn=False)
 
     def _handle_running(self, g: db.Game, sess: ActiveSession,
                         procs: list[psutil.Process], now: float):
         if not procs:
-            db.close_session(self.conn, sess.session_id, int(now), "self_exit")
+            # 结束时间取最后一次看到进程的时刻，不是现在——两者在正常轮询下只差 1 秒，
+            # 但守护空窗后重新扫到"进程已没了"时能差出几小时，那段不该算游玩、也不该推后冷却
+            db.close_session(self.conn, sess.session_id, int(sess.last_seen_ts), "self_exit")
             del self.active[g.id]
-            log.info(f"会话结束（自行退出）：{g.name}")
+            played = sess.block_played / 60
+            left = rules.block_remaining(g.session_minutes,
+                                         {"limit_minutes": sess.limit_minutes,
+                                          "played_seconds": sess.block_played})
+            log.info(f"会话结束（自行退出）：{g.name}，本段已玩 {played:.1f} 分钟"
+                     + (f"，剩余额度 {left/60:.1f} 分钟（{config.IDLE_GRACE_MINUTES:g} 分钟内"
+                        f"再打开可接着玩）" if left else ""))
             return
 
-        dl = rules.session_deadline(g, sess.start_ts, now, sess.limit_minutes)
+        # 心跳：只累计**这一轮真实观测到**的时间，守护崩掉/机器睡眠的空窗被 cap 掉
+        sess.played_seconds += min(max(0.0, now - sess.last_seen_ts), config.HEARTBEAT_MAX_GAP)
+        sess.last_seen_ts = now
+        db.heartbeat(self.conn, sess.session_id, sess.played_seconds, now)
+
+        dl = rules.session_deadline(g, now, sess.block_played, sess.limit_minutes)
         if dl is None:
             return
         deadline, reason = dl
@@ -262,7 +322,8 @@ class Daemon:
 def main():
     _setup_logging()
     if not hold_mutex(DAEMON_MUTEX):
-        log.info("已有守护进程实例在运行，本实例退出")
+        # debug 级：计划任务每分钟拉一次自愈，这是**正常**状态，不该占 INFO 把日志刷满
+        log.debug("已有守护进程实例在运行，本实例退出")
         return
     from .setup_system import grant_users_write
     grant_users_write()   # SYSTEM 身份启动时顺手修数据目录 ACL（自愈已踩坑的机器）
