@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GameLimiter 帧时间体检</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background:#0b0f14; color:#e6edf3; font-family:"Microsoft YaHei","Segoe UI",sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  #ui { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+        pointer-events:none; }
+  #panel { pointer-events:auto; background:rgba(10,14,20,.93); border:1px solid #2b3a4a;
+           border-radius:14px; padding:26px 30px; max-width:min(920px,92vw); max-height:92vh;
+           overflow:auto; box-shadow:0 18px 60px rgba(0,0,0,.6); }
+  h1 { font-size:20px; margin-bottom:6px; }
+  .sub { color:#8fa3b8; font-size:13px; line-height:1.7; margin-bottom:16px; }
+  button { pointer-events:auto; background:#2f81f7; color:#fff; border:0; border-radius:9px;
+           padding:12px 26px; font-size:15px; cursor:pointer; font-family:inherit; }
+  button:hover { background:#4b95ff; }
+  button:disabled { background:#39424d; cursor:default; }
+  #status { position:fixed; top:14px; left:14px; background:rgba(10,14,20,.85);
+            border:1px solid #2b3a4a; border-radius:9px; padding:10px 14px; font-size:14px;
+            font-variant-numeric:tabular-nums; line-height:1.6; display:none; }
+  table { border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums;
+          margin-top:12px; }
+  th,td { border:1px solid #2b3a4a; padding:6px 9px; text-align:right; }
+  th { background:#16202b; color:#9fb3c8; text-align:center; }
+  td:first-child, th:first-child { text-align:left; }
+  .k { color:#8fa3b8; }
+  .v { color:#e6edf3; font-variant-numeric:tabular-nums; }
+  .good { color:#3fb950; } .warn { color:#d29922; } .bad { color:#f85149; }
+  .env { font-size:12.5px; line-height:1.9; background:#0f151d; border:1px solid #22303d;
+         border-radius:9px; padding:12px 14px; margin-bottom:14px; }
+  #verdict { margin-top:16px; font-size:14px; line-height:1.85; border-top:1px solid #2b3a4a; padding-top:14px; }
+  code { background:#16202b; padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status"></div>
+<div id="ui"><div id="panel">
+  <h1>GameLimiter 帧时间体检</h1>
+  <div class="sub">
+    三段各 12 秒（轻 → 中 → 重负载），全程按屏幕刷新率出帧。<br>
+    <b>请先按 F11 全屏，并保持这个窗口在最前面别切走</b>——切走浏览器会自动降帧，数据就废了。
+  </div>
+  <div class="env" id="env">正在读取显卡信息…</div>
+  <button id="go">开始测试（约 40 秒）</button>
+  <div id="out"></div>
+</div></div>
+
+<script>
+"use strict";
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', { antialias:false, powerPreference:'high-performance',
+                                     desynchronized:false });
+
+// ---------- 环境信息：这一步就能看出画面渲染在哪块显卡上 ----------
+const envBox = document.getElementById('env');
+let vendor = '?', renderer = '?';
+if (gl) {
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  if (dbg) {
+    vendor   = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+    renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+  }
+}
+const dpr = window.devicePixelRatio || 1;
+envBox.innerHTML =
+  '<span class="k">渲染器　</span><span class="v">' + renderer + '</span><br>' +
+  '<span class="k">厂商　　</span><span class="v">' + vendor + '</span><br>' +
+  '<span class="k">屏幕　　</span><span class="v">' + screen.width + '×' + screen.height +
+    '，缩放 ' + dpr + '×，窗口 ' + innerWidth + '×' + innerHeight + '</span>';
+if (!gl) { envBox.innerHTML = '<span class="bad">WebGL2 不可用——这本身就是显卡/驱动异常的信号</span>'; }
+
+// ---------- 着色器：可调迭代次数的光线步进，制造真实 GPU 负载 ----------
+const VS = `#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);
+             gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform vec2 uRes; uniform float uT; uniform int uIter;
+out vec4 o;
+float de(vec3 p){
+  vec3 z=p; float dr=1.0, r=0.0;
+  for(int i=0;i<8;i++){
+    r=length(z); if(r>2.0) break;
+    float th=acos(z.z/r), ph=atan(z.y,z.x);
+    dr=pow(r,7.0)*8.0*dr+1.0;
+    float zr=pow(r,8.0); th*=8.0; ph*=8.0;
+    z=zr*vec3(sin(th)*cos(ph), sin(ph)*sin(th), cos(th))+p;
+  }
+  return 0.5*log(r)*r/dr;
+}
+void main(){
+  vec2 uv=(gl_FragCoord.xy-0.5*uRes)/uRes.y;
+  vec3 ro=vec3(sin(uT*0.25)*2.6, 0.35, cos(uT*0.25)*2.6);
+  vec3 ww=normalize(-ro), uu=normalize(cross(vec3(0,1,0),ww)), vv=cross(ww,uu);
+  vec3 rd=normalize(uv.x*uu+uv.y*vv+1.7*ww);
+  float t=0.0; int steps=0;
+  for(int i=0;i<256;i++){
+    if(i>=uIter) break;
+    vec3 p=ro+rd*t; float d=de(p);
+    if(d<0.0006||t>7.0) break;
+    t+=d; steps=i;
+  }
+  float g=float(steps)/float(uIter);
+  vec3 col=mix(vec3(0.03,0.05,0.09), vec3(0.35,0.72,1.0), g);
+  col+=vec3(1.0,0.55,0.25)*pow(g,4.0)*0.9;
+  o=vec4(col,1.0);
+}`;
+
+function mkShader(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+let prog, uRes, uT, uIter;
+if (gl) {
+  prog = gl.createProgram();
+  gl.attachShader(prog, mkShader(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  uRes = gl.getUniformLocation(prog,'uRes');
+  uT   = gl.getUniformLocation(prog,'uT');
+  uIter= gl.getUniformLocation(prog,'uIter');
+}
+
+function resize(){
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+}
+
+// ---------- 统计 ----------
+function pct(sorted, p){ if(!sorted.length) return 0;
+  return sorted[Math.min(sorted.length-1, Math.max(0, Math.round((sorted.length-1)*p)))]; }
+
+function analyze(dts){
+  // 丢掉每段头 12 帧（着色器预热 / 分辨率切换）
+  const d = dts.slice(12).filter(x => x > 0 && x < 500);
+  if (d.length < 20) return null;
+  const s = [...d].sort((a,b)=>a-b);
+  const avg = d.reduce((a,b)=>a+b,0)/d.length;
+  const p50 = pct(s,0.50), p95 = pct(s,0.95), p99 = pct(s,0.99), mx = s[s.length-1];
+  // 1% low：最慢 1% 帧的平均帧率（业界通用口径）
+  const worst = s.slice(Math.floor(s.length*0.99));
+  const low1 = 1000 / (worst.reduce((a,b)=>a+b,0)/worst.length);
+  // 卡顿计数：超过中位数 2 倍的帧
+  const hitch = d.filter(x => x > p50*2).length;
+  return { n:d.length, fps:1000/avg, p50, p95, p99, max:mx, low1,
+           hitch, hitchPer60s: hitch/(d.reduce((a,b)=>a+b,0)/1000)*60 };
+}
+
+// ---------- 跑测 ----------
+const PHASES = [
+  { name:'轻负载（探显示链路）', iter:24,  secs:12 },
+  { name:'中负载',              iter:80,  secs:12 },
+  { name:'重负载（探显卡上限）', iter:200, secs:12 },
+];
+const statusEl = document.getElementById('status');
+const outEl    = document.getElementById('out');
+const goBtn    = document.getElementById('go');
+
+// 先测一段空闲刷新率基线，判断屏幕到底跑在多少 Hz
+function measureRefresh(ms){
+  return new Promise(res => {
+    const ts = []; let last = performance.now(); const t0 = last;
+    function step(now){ ts.push(now-last); last = now;
+      if (now-t0 < ms) requestAnimationFrame(step); else res(ts); }
+    requestAnimationFrame(step);
+  });
+}
+
+function runPhase(ph){
+  return new Promise(res => {
+    const dts = []; let last = performance.now(); const t0 = last;
+    function frame(now){
+      const dt = now - last; last = now; dts.push(dt);
+      resize();
+      gl.viewport(0,0,cv.width,cv.height);
+      gl.useProgram(prog);
+      gl.uniform2f(uRes, cv.width, cv.height);
+      gl.uniform1f(uT, now/1000);
+      gl.uniform1i(uIter, ph.iter);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const el = (now-t0)/1000;
+      statusEl.textContent = ph.name + '　' + el.toFixed(1) + ' / ' + ph.secs + ' s　'
+                           + (1000/dt).toFixed(0) + ' fps';
+      if (el < ph.secs) requestAnimationFrame(frame);
+      else res(dts);
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+goBtn.addEventListener('click', async () => {
+  if (!gl) return;
+  goBtn.disabled = true;
+  document.getElementById('ui').style.display = 'none';
+  statusEl.style.display = 'block';
+
+  statusEl.textContent = '测量屏幕刷新率…';
+  const idle = await measureRefresh(2000);
+  const idleS = idle.slice(10).sort((a,b)=>a-b);
+  const refreshMs = pct(idleS, 0.5);
+  const refreshHz = 1000/refreshMs;
+
+  const results = [];
+  for (const ph of PHASES) {
+    const dts = await runPhase(ph);
+    results.push({ phase: ph.name, iter: ph.iter, ...analyze(dts) });
+  }
+
+  statusEl.style.display = 'none';
+  document.getElementById('ui').style.display = 'flex';
+
+  // ---------- 出报告 ----------
+  const f = (x, d=2) => (x===undefined||x===null) ? '-' : x.toFixed(d);
+  let html = '<table><tr><th>阶段</th><th>平均 fps</th><th>1% low</th>'
+           + '<th>帧时间中位</th><th>p95</th><th>p99</th><th>最大</th><th>卡顿/分钟</th></tr>';
+  for (const r of results) {
+    if (!r.n) { html += '<tr><td>'+r.phase+'</td><td colspan="7">采样不足</td></tr>'; continue; }
+    const cls = r.hitchPer60s > 30 ? 'bad' : (r.hitchPer60s > 6 ? 'warn' : 'good');
+    html += '<tr><td>'+r.phase+'</td><td>'+f(r.fps,1)+'</td><td>'+f(r.low1,1)+'</td>'
+          + '<td>'+f(r.p50)+' ms</td><td>'+f(r.p95)+' ms</td><td>'+f(r.p99)+' ms</td>'
+          + '<td>'+f(r.max,1)+' ms</td><td class="'+cls+'">'+f(r.hitchPer60s,1)+'</td></tr>';
+  }
+  html += '</table>';
+
+  // ---------- 自动判读 ----------
+  const light = results[0], heavy = results[2];
+  const v = [];
+  const onNv = /nvidia|rtx|geforce/i.test(renderer);
+  v.push(onNv
+    ? '<span class="good">✔ 画面确实渲染在 NVIDIA 显卡上</span>（渲染器：' + renderer + '）'
+    : '<span class="bad">✘ 画面没走 NVIDIA 显卡！</span> 渲染器是「' + renderer
+      + '」——如果这里是虚拟显示器或软件渲染，就是卡顿的直接原因');
+
+  if (refreshHz > 150)
+    v.push('<span class="good">✔ 屏幕跑在 ' + refreshHz.toFixed(0) + ' Hz</span>（帧间隔 '
+           + refreshMs.toFixed(2) + ' ms）');
+  else
+    v.push('<span class="bad">✘ 屏幕只跑在 ' + refreshHz.toFixed(0) + ' Hz</span>——显示器刷新率没设到 165 Hz，'
+           + '这会让画面天然比该有的糊/顿');
+
+  if (light && light.n) {
+    if (light.hitchPer60s > 30)
+      v.push('<span class="bad">✘ 轻负载下每分钟就有 ' + light.hitchPer60s.toFixed(0)
+             + ' 次卡顿</span>——显卡根本没吃力却在掉帧，问题出在系统/显示链路，不在游戏');
+    else if (light.hitchPer60s > 6)
+      v.push('<span class="warn">△ 轻负载下每分钟 ' + light.hitchPer60s.toFixed(0)
+             + ' 次卡顿</span>——偏多，系统层面有干扰');
+    else
+      v.push('<span class="good">✔ 轻负载下画面平稳</span>（每分钟仅 '
+             + light.hitchPer60s.toFixed(1) + ' 次卡顿），显示链路本身健康');
+  }
+  if (heavy && heavy.n)
+    v.push('重负载下 ' + heavy.fps.toFixed(1) + ' fps / 1% low ' + heavy.low1.toFixed(1)
+           + ' fps——这段用来对比显卡的实际吞吐是否正常');
+
+  html += '<div id="verdict">' + v.map(x=>'· '+x).join('<br>') + '</div>';
+  html += '<div class="sub" style="margin-top:14px">结果已自动下载为 JSON（在「下载」文件夹），'
+        + '也可以直接把这张表截图发我。</div>';
+  outEl.innerHTML = html;
+  goBtn.textContent = '重新测一次'; goBtn.disabled = false;
+
+  // ---------- 落盘，方便我这边远程读取 ----------
+  const payload = { ts:new Date().toISOString(), renderer, vendor,
+                    screen:{ w:screen.width, h:screen.height, dpr,
+                             win:[innerWidth, innerHeight] },
+                    refreshHz, refreshMs, results };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'gl_frametest.json';
+  a.click();
+});
+</script>
+</body>
+</html>

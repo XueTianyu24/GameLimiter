@@ -18,7 +18,8 @@ from pathlib import Path
 import psutil
 from nicegui import app, run, ui
 
-from . import changes, config, db, icons, rules, setup_system, stats, steam, updater
+from . import (changes, config, db, frames, icons, rules, setup_system, stats,
+               steam, updater)
 from .version import __version__
 from .winutil import (DAEMON_MUTEX, is_frozen, mutex_exists, run_elevated,
                       spawn_detached)
@@ -146,6 +147,88 @@ def quick_dates(today: date) -> list[tuple[str, date]]:
     return [("明天", today + timedelta(1)), ("后天", today + timedelta(2)), ("周六", sat)]
 
 
+CAPTURE_ARM_HOURS = 4.0        # 下单后待命多久没等到游戏就作废
+
+
+def capture_status(gid: int) -> tuple[str, bool]:
+    """(状态文字, 有没有活跃任务)。给卡片每秒刷新用。"""
+    job = db.active_capture_job(conn, gid)
+    if job is None:
+        return "", False
+    if job["state"] == "armed":
+        left = (job["expires_at"] - time.time()) / 3600
+        return f"采集待命中 · 打开游戏就开始（还有 {left:.1f} 小时）", True
+    if job["duration_minutes"] and job["started_ts"]:
+        left = max(0.0, job["started_ts"] + job["duration_minutes"] * 60 - time.time())
+        return f"采集中 · 还剩 {int(left // 60)}:{int(left % 60):02d}", True
+    return "采集中 · 一直采到游戏退出", True
+
+
+def open_capture_dialog(g: db.Game):
+    """下一单性能采集：时长 + 存放目录 + 要不要留原始数据。"""
+    with ui.dialog() as dlg, ui.card().classes("w-[440px] rounded-2xl gap-3"):
+        ui.label(f"采集「{g.name}」的性能数据").classes("text-lg font-bold text-slate-800")
+        ui.label("下单后打开游戏就开始采，到点自动停（游戏照玩，不受影响）。"
+                 "采集是旁路记录，不改任何限制规则。").classes("text-xs text-slate-500")
+
+        ui.label("采多久").classes("text-sm font-medium text-slate-600 -mb-1")
+        mins = ui.number(value=10, min=0, step=5, suffix="分钟") \
+            .classes("w-full").props("dense")
+        ui.toggle({5: "5 分钟", 10: "10 分钟", 30: "30 分钟", 60: "1 小时", 0: "整场"},
+                  value=10, on_change=lambda e: mins.set_value(e.value)) \
+            .props("dense unelevated toggle-color=indigo size=sm")
+        ui.label("填 0 = 一直采到游戏退出").classes("text-xs text-slate-400 -mt-1")
+
+        ui.label("数据存放到").classes("text-sm font-medium text-slate-600 -mb-1")
+        with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+            out = ui.input(value=db.get_capture_out_dir(conn) or "",
+                           placeholder=str(frames.capture_dir())) \
+                .classes("flex-grow").props("dense") \
+                .tooltip("留空 = 默认数据目录。写盘的是 SYSTEM 身份的守护进程，"
+                         "用户级映射的网络盘它看不到，会自动回落默认目录")
+
+            async def pick_dir():
+                win = app.native.main_window
+                if win is None:
+                    ui.notify("浏览器模式不支持目录选择，请直接输入路径", type="warning")
+                    return
+                import webview
+                try:
+                    res = await run.io_bound(win.create_file_dialog,
+                                             webview.FileDialog.FOLDER)
+                except Exception as e:
+                    ui.notify(f"打开目录选择框失败：{e}", type="negative")
+                    return
+                if res:
+                    out.set_value(res[0])
+            ui.button("浏览…", on_click=pick_dir).props("flat dense size=sm color=grey")
+        keep = ui.switch("保留原始逐帧数据", value=True).props("dense color=indigo") \
+            .tooltip("一小时约 260 MB。关掉则只留约 10 KB 的摘要")
+        ui.label("硬件数据（1 Hz，两小时约 700 KB）一律保留").classes("text-xs text-slate-400")
+
+        def submit():
+            minutes = float(mins.value or 0) or None
+            path = (out.value or "").strip()
+            db.set_capture_out_dir(conn, path)
+            db.create_capture_job(conn, g.id, minutes, path or None, keep.value,
+                                  int(time.time() + CAPTURE_ARM_HOURS * 3600))
+            dlg.close()
+            how_long = f"{minutes:g} 分钟" if minutes else "整场"
+            if not daemon_running():
+                ui.notify("已下单，但守护进程没在跑——它不启动就不会采集", type="warning")
+            elif db.active_session(conn, g.id):
+                ui.notify(f"开始采集（{how_long}）", type="positive")
+            else:
+                ui.notify(f"已下单（{how_long}）：{CAPTURE_ARM_HOURS:g} 小时内打开游戏就开始采",
+                          type="positive")
+            games_view.refresh()
+
+        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+            ui.button("取消", on_click=dlg.close).props("flat color=grey")
+            ui.button("开始采集", on_click=submit).props("unelevated color=indigo")
+    dlg.open()
+
+
 def game_card(g: db.Game):
     with ui.card().classes("w-[340px] rounded-2xl shadow-md p-4 gap-2 bg-white"):
         with ui.row().classes("w-full items-center justify-between flex-nowrap"):
@@ -230,7 +313,26 @@ def game_card(g: db.Game):
         q.on("blur", commit_quota)
         q.on("keydown.enter", commit_quota)
 
+        # 性能采集：点了才采（v0.16.0 起）。按钮/倒计时/停止三态由下面的 upd 每秒切换
+        with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+            cap_btn = ui.button("采集性能数据", icon="insights",
+                                on_click=lambda g=g: open_capture_dialog(g)) \
+                .props("flat dense size=sm color=indigo") \
+                .tooltip("记录这次游玩的帧时间与硬件状态，可选时长与存放目录")
+            cap_txt = ui.label().classes("text-xs text-indigo-600 truncate")
+            ui.space()
+
+            def stop_capture(gid=g.id):
+                job = db.active_capture_job(conn, gid)
+                if job and db.cancel_capture_job(conn, job["id"]):
+                    ui.notify("已停止采集" + ("，数据正在收尾入库" if job["state"] == "running"
+                                              else "（还没开始，直接取消）"), type="positive")
+                games_view.refresh()
+            cap_stop = ui.button("停止", on_click=stop_capture) \
+                .props("flat dense size=sm color=red")
+
         def upd(gid=g.id, chip=chip, sub=sub, q_label=q_label, q_full=q_full,
+                cap_btn=cap_btn, cap_txt=cap_txt, cap_stop=cap_stop,
                 seen={"in": bool(sess0)}):
             fresh = conn.execute("SELECT * FROM games WHERE id=?", (gid,)).fetchone()
             if not fresh:
@@ -242,6 +344,11 @@ def game_card(g: db.Game):
             sub.visible = bool(extra)
             q_label.text = "本次玩" if in_sess else "下次玩"
             q_full.visible = not in_sess            # 游玩中不许放回上限
+            cap_text, capturing = capture_status(gid)
+            cap_txt.text = cap_text
+            cap_txt.visible = capturing
+            cap_btn.visible = not capturing
+            cap_stop.visible = capturing
             if in_sess != seen["in"]:
                 seen["in"] = in_sess                # 会话开/关 → 额度框的值与语义都变了
                 games_view.refresh()

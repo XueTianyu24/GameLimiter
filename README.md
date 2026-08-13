@@ -25,6 +25,30 @@ Windows 11 上的游戏自我防沉迷工具：给自己的游戏加上"打不�
 - **启动前拦截**：不满足条件时游戏进程秒杀 + 弹窗告知解锁时间（还没进对局，无代价）
 - **运行中限制**：到点前 10 / 5 / 1 分钟多级预警倒计时，给你时间自己退出对局——**不会在 PVP 对局中途偷袭强杀**（避免判逃跑）
 
+## 观察模式（PVP 游戏用）
+
+登记时加 `--monitor`（或在卡片上开启）：**只记录、不施加任何限制**，也不占「每天最多玩几款」的名额。给永劫无间这类**强杀会判逃跑扣分**的游戏用——这条路径上程序不会有任何理由去终止它。
+
+开关本身仍受管制：打开算放宽（延迟 24 小时），关掉算收紧（立即生效）。
+
+## 性能采集（可选）
+
+想知道"刚才那局到底卡在哪"时，可以让它顺便记一段数据：
+
+- **帧时间**（基于 [Intel PresentMon](https://github.com/GameTechDev/PresentMon)，MIT）：平均 fps、1% low、卡顿次数，以及**瓶颈定性**——显卡吃满 / CPU 吃满 / 帧率被限制 / 都没吃满
+- **硬件状态**（1 Hz）：CPU 各核占用、内存、磁盘读写、GPU 占用·显存·温度·功耗·**降频原因**、游戏进程自身的 CPU·内存·缺页
+
+**采集是手动触发的**：卡片上点「采集性能数据」，选采多久（5/10/30/60 分钟或整场）、数据存哪儿、要不要保留原始逐帧数据。**不点就不采**，程序不会在背后一直记录你。时长到点只停止采集，**游戏照玩不受影响**。
+
+```
+GameLimiter.exe --cli capture <exe> --minutes 10 --out "D:\采集数据"
+GameLimiter.exe --cli capture <exe> --stop     # 停止
+GameLimiter.exe --cli frames <exe>             # 看历次帧时间报告
+GameLimiter.exe --cli hw <exe> --paths         # 看历次硬件记录（含原始 CSV 路径）
+```
+
+> 帧采集需要管理员或 `Performance Log Users` 权限；配置了强制层后守护以 SYSTEM 运行，天然满足。逐帧数据一小时约 260 MB，默认聚合成约 10 KB 的摘要后立即删除；手动采集时可选择保留原始文件。
+
 ## 防绕过设计（诚实说明）
 
 你自己就是管理员，"绝对防绕过"不存在。本工具的目标是把**一时冲动**的绕过成本抬高到冷静下来的程度：
@@ -61,21 +85,26 @@ GameLimiter.exe --cli daily 2       # 每天最多玩 2 款游戏（留空查看
 GameLimiter.exe --cli set <exe> --until 2026-08-02   # 下次可玩日（也可 +3 / off）
 GameLimiter.exe --cli history       # 游玩记录与拦截事件
 GameLimiter.exe --cli pending       # 待生效的放宽变更（可 --cancel <id> 反悔）
+GameLimiter.exe --cli capture <exe> --minutes 10     # 采一段性能数据（见上）
 GameLimiter.exe --remove-system     # 卸载强制层（需管理员）
 ```
 
 ## 从源码运行 / 构建
 
 ```bash
-pip install psutil wmi "nicegui[native]" pyinstaller
+pip install psutil wmi "nicegui[native]" pyinstaller pefile
 python -m gamelimiter.app                 # GUI
 python -m gamelimiter.app --daemon        # 守护进程
 python tests/test_rules.py && python tests/test_changes.py
 
-# 打包单 exe（conda 环境注意：需显式收集 Library/bin/ffi-8.dll）
-pyinstaller --noconfirm --name GameLimiter --windowed --onefile ^
-  --add-data "<site-packages>/nicegui;nicegui" app.py
+python scripts/fetch_presentmon.py        # 拉帧采集器（带 sha256 校验，不进仓库）
+python scripts/build_exe.py               # 打包单 exe → dist/GameLimiter.exe
 ```
+
+> 打包脚本会用 pefile 读取 C 扩展的真实 DLL 导入名并自动收集——conda 环境里
+> `_ctypes` 链接的是 `ffi.dll` 而非 PyInstaller 默认找的 `ffi-8.dll`，手写清单容易漏，
+> 结果是"开发机能跑、换台干净机器启动即崩"。打包后建议用最小 PATH 跑一次
+> `GameLimiter.exe --selftest` 验证。
 
 ## 技术栈
 

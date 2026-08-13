@@ -6,6 +6,7 @@
 
 import os
 from pathlib import Path
+from typing import Optional
 
 
 def _data_dir() -> Path:
@@ -25,6 +26,31 @@ def _data_dir() -> Path:
 DATA_DIR = _data_dir()
 DB_PATH = DATA_DIR / "gamelimiter.db"
 LOG_PATH = DATA_DIR / "daemon.log"
+
+
+def resolve_capture_dir(out_dir: Optional[str], default_sub: str) -> tuple[Path, Optional[str]]:
+    """采集数据的落脚目录：优先用户指定的，用不了就回落 `DATA_DIR/<default_sub>`。
+
+    返回 (目录, 回落原因)；回落原因非 None = 用户指定的那个目录没法用。
+
+    **实际执笔的是 SYSTEM 身份的守护进程**，不是选目录的那个 GUI：用户级映射的网络盘
+    SYSTEM 根本看不见，OneDrive 之类也可能拒写。这种时候宁可把数据写回默认目录，
+    也不能让一次采集因为目录问题整个泡汤——数据采回来了才有得谈。
+    """
+    reason = None
+    if out_dir:
+        d = Path(out_dir)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".gl_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return d, None
+        except OSError as e:
+            reason = f"{e.__class__.__name__}: {e}"
+    d = DATA_DIR / default_sub
+    d.mkdir(parents=True, exist_ok=True)
+    return d, reason
 
 POLL_INTERVAL = 1.0          # psutil 轮询间隔（秒）
 RULE_RELOAD_INTERVAL = 5.0   # 从 SQLite 重载规则的间隔（秒）

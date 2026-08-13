@@ -102,6 +102,26 @@ def _schtasks(*args):
                           errors="ignore", creationflags=_NOWIN)
 
 
+def _restore_tasks(log, why: str):
+    """更新失败时把计划任务恢复回去。
+
+    **不恢复就等于把强制层关在那儿**：apply_update 第一步为了防复活先 DISABLE 了
+    守护任务与自愈任务，中途失败直接 return 的话，机器就停在"计划任务已停 + 守护已杀"
+    的中间态，而且没人会去恢复它——用户只看到"更新失败了"，不会知道防护也一起没了。
+    """
+    from .setup_system import TASK_DAEMON, TASK_HEAL, is_configured
+    if not is_configured():
+        return
+    _log(log, f"回滚：恢复计划任务（{why}）")
+    for tn in (TASK_DAEMON, TASK_HEAL):
+        r = _schtasks("/Change", "/TN", tn, "/ENABLE")
+        if r.returncode != 0:
+            _log(log, f"FAIL: 恢复 {tn} 失败（rc={r.returncode}）{(r.stderr or '').strip()[:120]}")
+    r = _schtasks("/Run", "/TN", TASK_DAEMON)
+    _log(log, "守护已重新拉起" if r.returncode == 0 else
+         f"FAIL: 拉守护失败（rc={r.returncode}）——强制层可能仍是关着的，需手动检查")
+
+
 def apply_update(target_str: str) -> int:
     """把自己（新 exe）顶替到 target 路径。返回退出码。"""
     from .winutil import is_frozen
@@ -140,8 +160,21 @@ def apply_update(target_str: str) -> int:
                     time.sleep(1.0)
             else:
                 _log(log, "FAIL: 旧 exe 一直被占用，放弃")
+                _restore_tasks(log, "换文件失败，旧版原地不动")
                 return 1
-            me.rename(target)
+            try:
+                me.rename(target)
+            except OSError as e:
+                # 最坏的一格：旧 exe 已改名 .old，新的又没顶上去 → 原路放回，
+                # 否则计划任务指向的路径上一个文件都没有，守护再也起不来
+                _log(log, f"FAIL: 新 exe 顶替失败（{type(e).__name__}: {e}），把旧版放回")
+                try:
+                    old.rename(target)
+                    _log(log, "旧 exe 已还原")
+                except OSError as e2:
+                    _log(log, f"FAIL: 还原也失败（{e2}）——请手动把 {old.name} 改回 {target.name}")
+                _restore_tasks(log, "换文件失败，已还原旧版")
+                return 1
             _log(log, "swapped OK")
             # 4 恢复任务并拉起守护；未配置强制层则直接起守护进程
             from .setup_system import is_configured
@@ -160,4 +193,8 @@ def apply_update(target_str: str) -> int:
             return 0
         except Exception as e:                      # noqa: BLE001 全兜底进日志
             _log(log, f"FAIL: {type(e).__name__}: {e}")
+            try:
+                _restore_tasks(log, "更新过程异常")
+            except Exception as e2:                 # noqa: BLE001 回滚本身也不许再抛
+                _log(log, f"FAIL: 回滚异常 {type(e2).__name__}: {e2}")
             return 1

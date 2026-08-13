@@ -102,6 +102,17 @@ def unlock_datetime(date_str: str, windows: Optional[list]) -> datetime:
     return day0
 
 
+def is_observed(game: Game) -> bool:
+    """观察模式：只采数据、不施加任何限制。
+
+    给 PVP 这类**强杀会判逃跑**的游戏用——想看它的帧时间与硬件数据，
+    但绝不能让守护有任何理由去终止它。绕过点有三处，缺一不可：
+    启动检查（本文件 `check_start`）、运行中截止（`session_deadline`）、
+    以及全局「每天最多玩几款」（在 `db.games_played_between` 里就不计入）。
+    """
+    return bool(getattr(game, "monitor_only", False))
+
+
 def check_start(game: Game, last_end_ts: Optional[int], now_ts: float,
                 resuming: bool = False) -> StartVerdict:
     """启动前检查：下次可玩日 + 冷却 + 时段。
@@ -110,6 +121,9 @@ def check_start(game: Game, last_end_ts: Optional[int], now_ts: float,
     冷却管的是"两段游玩之间隔多久"，中途去吃个饭再回来不该被它咬。
     可玩日与时段是硬边界，续玩照查——22:00 到点就是不许再开。
     """
+    if is_observed(game):
+        return StartVerdict(True)
+
     now = datetime.fromtimestamp(now_ts)
 
     # 规则 a 第一道门：锁到某天（跨天规划）。过期即失效，不用手动清
@@ -185,6 +199,8 @@ def session_deadline(game: Game, now_ts: float, played_seconds: float = 0.0,
     `limit_minutes` = 本段额度，与游戏上限取更严者。
     时段规则：若 now 已在时段外（时段中途结束/规则收紧），deadline=now 立即到点。
     """
+    if is_observed(game):
+        return None                 # 观察模式永不设截止 = 守护永远不会去杀它
     cands: list[tuple[float, str]] = []
     limit = effective_limit(game.session_minutes, limit_minutes)
     if limit:

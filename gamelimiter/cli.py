@@ -14,7 +14,8 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-from . import changes, config, db, rules
+from . import changes, config, db, frames, hardware, rules
+from .winutil import DAEMON_MUTEX, mutex_exists
 
 
 def _num_or_off(s):
@@ -39,10 +40,24 @@ def _fmt_ts(ts):
 
 def cmd_add(conn, a):
     from . import icons
+    existed = db.get_game(conn, a.exe)
     g = db.upsert_game(conn, a.name, a.exe, exe_path=a.path,
                        cooldown_hours=a.cooldown, session_minutes=a.session,
                        windows=a.windows or None, icon=icons.extract_icon(a.path))
-    print(f"已添加/更新 [{g.id}] {g.name} ({g.exe_name})")
+    if a.monitor:
+        if existed:
+            # 已存在的游戏改观察模式 = 卸掉限制 = 放宽，必须走 24h 冷静期
+            applied, delayed = changes.request_changes(conn, existed, {"monitor_only": 1})
+            for f, v, at in delayed:
+                print(f"放宽延迟：改为观察模式 → {_fmt_ts(at)} 生效")
+            if applied:
+                print("已改为观察模式")
+        else:
+            # 全新登记的游戏本来就不受任何限制，转观察模式不构成放宽 → 立即生效
+            db.update_rules(conn, g.id, monitor_only=1)
+            g = db.get_game(conn, a.exe)
+    tag = "（观察模式：只采数据，不施加任何限制）" if g.monitor_only else ""
+    print(f"已添加/更新 [{g.id}] {g.name} ({g.exe_name}){tag}")
 
 
 def cmd_list(conn, a):
@@ -54,6 +69,11 @@ def cmd_list(conn, a):
         print("（无受限游戏）")
         return
     for g in games:
+        if g.monitor_only:
+            last = db.last_session_end(conn, g.id)
+            print(f"[{g.id}] {g.name} ({g.exe_name}) — 观察模式：只采集帧与硬件数据，"
+                  f"不施加任何限制、不占每天款数名额；上次结束 {_fmt_ts(last)}")
+            continue
         rules_desc = []
         if g.cooldown_hours:
             rules_desc.append(f"冷却 {g.cooldown_hours:g}h")
@@ -87,6 +107,8 @@ def cmd_set(conn, a):
         fields["next_allowed_date"] = _date_or_off(a.until)
     if a.enable is not None:
         fields["enabled"] = int(a.enable)
+    if a.monitor is not None:
+        fields["monitor_only"] = int(a.monitor)
     applied, delayed = changes.request_changes(conn, g, fields)
     if applied:
         print(f"立即生效：{'、'.join(changes.FIELD_ZH[f] for f in applied)}")
@@ -166,6 +188,173 @@ def cmd_pending(conn, a):
         print(f"已取消 [{a.cancel}]")
 
 
+def cmd_frames(conn, a):
+    """帧时间记录：每次游玩采到的 fps / 1% low / 卡顿 / 瓶颈。"""
+    if a.on or a.off:
+        db.set_setting(conn, frames.SETTING_KEY, "1" if a.on else "0")
+        print("帧时间采集已" + ("开启" if a.on else "关闭") + "（下次开游戏生效）")
+        return
+
+    state = "开" if frames.enabled(conn) else "关"
+    pm = frames.presentmon_path()
+    print(f"帧时间采集：{state}；采集器 {pm if pm else '未找到（跑 python scripts/fetch_presentmon.py）'}")
+    if a.check:
+        ok, msg = frames.preflight()
+        print(f"可用性自检：{'可用' if ok else '不可用'} —— {msg}")
+
+    game = None
+    if a.exe:
+        game = db.get_game(conn, a.exe)
+        if not game:
+            sys.exit(f"未找到 {a.exe}")
+    rows = db.frame_runs(conn, game.id if game else None, limit=a.limit)
+    if not rows:
+        print("（还没有帧时间记录——玩一次就有了）")
+        return
+
+    names = {g.id: g.name for g in db.list_games(conn)}
+    for r in rows:
+        s = frames.load_summary(r)
+        head = (f"{names.get(r['game_id'], '?')}  {_fmt_ts(r['start_ts'])} → "
+                f"{_fmt_ts(r['end_ts'])}  段{r['block_id']}")
+        if not s.get("frames"):
+            why = f"：{s['error']}" if s.get("error") else ""
+            print(f"\n{head}  —— 没采到帧（{r['status']}）{why}")
+            continue
+        print(f"\n{head}  {s['seconds']/60:.1f}min  {s['frames']} 帧"
+              + ("  [尾部可能不全]" if r["status"] == "truncated" else ""))
+        for line in frames.describe(s):
+            print("  " + line)
+        if s.get("raw_csv"):
+            print("  原始逐帧数据 " + s["raw_csv"])
+        trend = s.get("per_minute") or []
+        if len(trend) >= 6:                      # 够长才看得出"越玩越卡"
+            head_fps = sum(p[1] for p in trend[:3]) / 3
+            tail_fps = sum(p[1] for p in trend[-3:]) / 3
+            drop = (head_fps - tail_fps) / head_fps * 100 if head_fps else 0
+            if abs(drop) >= 5:
+                word = "越玩越卡" if drop > 0 else "越玩越顺"
+                print(f"  趋势 {word}：开头 {head_fps:.0f} fps → 结尾 {tail_fps:.0f} fps"
+                      f"（{abs(drop):.0f}%）")
+
+
+def cmd_hw(conn, a):
+    """游玩期间的硬件采集记录（1 Hz：CPU / 内存 / 磁盘 / GPU / 游戏进程 / 干扰进程）。"""
+    if a.on or a.off:
+        db.set_setting(conn, hardware.SETTING_KEY, "1" if a.on else "0")
+        print("硬件采集已" + ("开启" if a.on else "关闭") + "（下次开游戏生效）")
+        return
+
+    print(f"硬件采集：{'开' if hardware.enabled(conn) else '关'}；"
+          f"原始数据目录 {hardware.capture_dir()}")
+    game = None
+    if a.exe:
+        game = db.get_game(conn, a.exe)
+        if not game:
+            sys.exit(f"未找到 {a.exe}")
+    rows = db.hw_runs(conn, game.id if game else None, limit=a.limit)
+    if not rows:
+        print("（还没有硬件采集记录——玩一次就有了）")
+        return
+    names = {g.id: g.name for g in db.list_games(conn)}
+    for r in rows:
+        s = hardware.load_summary(r)
+        print(f"\n{names.get(r['game_id'], '?')}  {_fmt_ts(r['start_ts'])} → "
+              f"{_fmt_ts(r['end_ts'])}  段{r['block_id']}  {r['samples']} 个采样点")
+        for line in hardware.describe(s):
+            print("  " + line)
+        if a.paths:
+            print("  原始数据 " + (r["csv_path"] or "-"))
+
+
+CAPTURE_ARM_HOURS = 4.0        # 下单后待命多久没等到游戏就作废
+
+
+def _job_line(r, names) -> str:
+    dur = f"{r['duration_minutes']:g} 分钟" if r["duration_minutes"] else "采到游戏退出"
+    where = r["out_dir"] or "默认目录"
+    head = f"[{r['id']}] {names.get(r['game_id'], '?')}  {dur}  → {where}"
+    if r["state"] == "armed":
+        left = (r["expires_at"] - time.time()) / 3600
+        return f"{head}  待命中（{left:.1f} 小时内开游戏就采）"
+    if r["state"] == "running":
+        if r["duration_minutes"]:
+            left = r["started_ts"] + r["duration_minutes"] * 60 - time.time()
+            return f"{head}  采集中，还剩 {max(0, left)/60:.1f} 分钟"
+        return f"{head}  采集中"
+    zh = {"done": "已结束", "cancelled": "已取消", "expired": "已过期"}
+    return (f"{head}  {zh.get(r['state'], r['state'])}"
+            f"  {_fmt_ts(r['started_ts'])} → {_fmt_ts(r['ended_ts'])}"
+            + (f"  {r['note']}" if r["note"] else ""))
+
+
+def cmd_capture(conn, a):
+    """手动采集：下单 → 守护接单 → 到点自动收尾。不下单就不采（v0.16.0 起的默认）。"""
+    if a.mode:
+        db.set_capture_mode(conn, a.mode)
+        print("采集模式已设为 " + ("自动（开游戏就采）" if a.mode == "auto" else
+                                   "手动（下单了才采）"))
+        return
+
+    names = {g.id: g.name for g in db.list_games(conn)}
+    mode = db.get_capture_mode(conn)
+    if not a.exe:
+        print(f"采集模式：{'自动（开游戏就采）' if mode == 'auto' else '手动（点了才采）'}"
+              f"；默认存放目录 {db.get_capture_out_dir(conn) or frames.capture_dir()}")
+        rows = db.capture_jobs(conn, limit=a.limit)
+        if not rows:
+            print("（还没有采集任务——`capture <exe> --minutes 10` 下一单）")
+        for r in rows:
+            print("  " + _job_line(r, names))
+        return
+
+    g = db.get_game(conn, a.exe)
+    if not g:
+        sys.exit(f"未找到 {a.exe}（先用 add 登记；只想采不想限就 add --monitor）")
+
+    if a.stop:
+        job = db.active_capture_job(conn, g.id)
+        if not job:
+            print(f"{g.name}：当前没有采集任务")
+            return
+        db.cancel_capture_job(conn, job["id"])
+        print(f"已停止采集任务 [{job['id']}]" +
+              ("（采集器 1 秒内收尾）" if job["state"] == "running" else "（待命中，直接取消）"))
+        return
+
+    if a.minutes is None and not a.whole:
+        job = db.active_capture_job(conn, g.id)
+        print(f"{g.name}：" + (_job_line(job, names) if job else "当前没有采集任务"))
+        for r in db.capture_jobs(conn, g.id, limit=a.limit):
+            if not job or r["id"] != job["id"]:
+                print("  " + _job_line(r, names))
+        return
+
+    minutes = None if a.whole else float(a.minutes)
+    if minutes is not None and minutes <= 0:
+        sys.exit("采集时长要大于 0（想采整场用 --whole）")
+    out_dir = a.out if a.out is not None else db.get_capture_out_dir(conn)
+    if a.out is not None:
+        db.set_capture_out_dir(conn, a.out)          # 记住这次的选择，下次默认用它
+    job_id = db.create_capture_job(conn, g.id, minutes, out_dir, not a.no_keep_raw,
+                                   int(time.time() + CAPTURE_ARM_HOURS * 3600))
+    running = db.active_session(conn, g.id) is not None
+    print(f"采集任务 [{job_id}] 已下单：{g.name}，"
+          + (f"{minutes:g} 分钟" if minutes else "采到游戏退出")
+          + f"，数据落 {out_dir or frames.capture_dir()}")
+    print("  " + ("游戏正在跑，守护 1 秒内开始采集" if running else
+                  f"{CAPTURE_ARM_HOURS:g} 小时内打开游戏就开始采；到时没开就作废"))
+    if not a.no_keep_raw:
+        est = f"约 {minutes * 260 / 60:.0f} MB" if minutes else "一小时约 260 MB"
+        print(f"  保留原始逐帧数据（{est}）；不想留加 --no-keep-raw")
+    if not mutex_exists(DAEMON_MUTEX):
+        print("  警告：守护进程没在跑，它不启动就不会采集")
+    if mode == "auto":
+        print("  注意：当前是自动模式，不下单也会采（`capture --mode manual` 改回手动）")
+    if frames.enabled(conn) and frames.presentmon_path() is None:
+        print("  警告：没找到 PresentMon.exe，帧数据采不到（硬件数据不受影响）")
+
+
 def cmd_history(conn, a):
     rows = conn.execute(
         """SELECT s.*, g.name FROM sessions s JOIN games g ON g.id=s.game_id
@@ -181,7 +370,28 @@ def cmd_history(conn, a):
         print(f"{_fmt_ts(r['ts'])}  {r['type']}  {r['detail'] or ''}")
 
 
+def _safe_console():
+    """让输出编码不成为故障源。两种情形分开处理：
+
+    1. **接真控制台**：跟随控制台编码（中文机器多为 GBK），只把编码不了的字符降级成
+       '?'。打包 exe 输出一个 GBK 没有的字符（如 ✓）会抛 UnicodeEncodeError 让命令
+       直接失败，更糟的是 --windowed 下还会弹对话框把进程挂住。
+    2. **被重定向到文件/管道**：强制 UTF-8。`--windowed` 打包的 exe 在 ssh 下必须把
+       stdout 重定向到文件才拿得到输出（USAGE 坑 10），而那时 Python 挑的编码可能是
+       ASCII，中文全变成 '?'——远程看自己的游玩报告全是问号，等于没有。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main():
+    _safe_console()
     ap = argparse.ArgumentParser(prog="gamelimiter.cli")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -192,6 +402,8 @@ def main():
     p.add_argument("--cooldown", type=float, default=None, help="间隔冷却（小时）")
     p.add_argument("--session", type=float, default=None, help="单次最长时长（分钟，上限）")
     p.add_argument("--windows", nargs="*", default=None, help="允许时段，如 19:00-23:00")
+    p.add_argument("--monitor", action="store_true",
+                   help="观察模式：只采帧与硬件数据，不施加任何限制（PVP 游戏用）")
     p.set_defaults(fn=cmd_add)
 
     p = sub.add_parser("list", help="列出游戏与规则")
@@ -205,6 +417,8 @@ def main():
     p.add_argument("--until", default=None,
                    help="下次可玩日：2026-08-02 / +3（3 天后）/ off；往后推即时，提前延迟 24h")
     p.add_argument("--enable", type=int, choices=(0, 1), default=None)
+    p.add_argument("--monitor", type=int, choices=(0, 1), default=None,
+                   help="观察模式开关：1=只观察不限制（放宽，延迟 24h）；0=恢复限制（立即）")
     p.set_defaults(fn=cmd_set)
 
     p = sub.add_parser("next", help="本次/下次游玩额度（≤上限；游玩中只可缩短）")
@@ -223,6 +437,35 @@ def main():
     p = sub.add_parser("history", help="会话与事件记录")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(fn=cmd_history)
+
+    p = sub.add_parser("frames", help="帧时间记录（fps / 1% low / 卡顿 / 瓶颈）")
+    p.add_argument("exe", nargs="?", default=None, help="留空=所有游戏")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--on", action="store_true", help="开启采集")
+    p.add_argument("--off", action="store_true", help="关闭采集")
+    p.add_argument("--check", action="store_true", help="试跑一次采集器，看当前权限够不够")
+    p.set_defaults(fn=cmd_frames)
+
+    p = sub.add_parser("hw", help="硬件采集记录（CPU / 内存 / 磁盘 / GPU / 干扰进程）")
+    p.add_argument("exe", nargs="?", default=None, help="留空=所有游戏")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--paths", action="store_true", help="显示原始 CSV 路径（供导出分析）")
+    p.add_argument("--on", action="store_true", help="开启采集")
+    p.add_argument("--off", action="store_true", help="关闭采集")
+    p.set_defaults(fn=cmd_hw)
+
+    p = sub.add_parser("capture", help="手动采集：下单一次采集（时长 / 存放目录自选）")
+    p.add_argument("exe", nargs="?", default=None, help="留空=看模式与任务列表")
+    p.add_argument("--minutes", type=float, default=None, help="采多少分钟")
+    p.add_argument("--whole", action="store_true", help="一直采到游戏退出")
+    p.add_argument("--out", default=None, help="数据存放目录（记住作为下次默认）")
+    p.add_argument("--no-keep-raw", action="store_true",
+                   help="不保留原始逐帧 CSV（默认保留，一小时约 260MB）")
+    p.add_argument("--stop", action="store_true", help="停止/取消该游戏的采集任务")
+    p.add_argument("--mode", choices=("manual", "auto"), default=None,
+                   help="manual=点了才采（默认）；auto=开游戏就自动采")
+    p.add_argument("--limit", type=int, default=5)
+    p.set_defaults(fn=cmd_capture)
 
     p = sub.add_parser("pending", help="查看/取消待生效的放宽变更")
     p.add_argument("--cancel", type=int, default=None, help="取消指定 id")

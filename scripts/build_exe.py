@@ -39,6 +39,18 @@ def main():
         cmd.append("--windowed")
     for loc in sorted(set(need.values())):
         cmd += ["--add-binary", f"{loc};."]
+
+    # 帧时间采集器（0.91 MB，相对 47MB 的 exe 可忽略）。不进 git，由 fetch 脚本拉
+    pm = ROOT / "vendor" / "PresentMon.exe"
+    if not pm.exists():
+        print("vendor/PresentMon.exe 不在，自动拉取…")
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "fetch_presentmon.py")], cwd=ROOT)
+    if pm.exists():
+        cmd += ["--add-binary", f"{pm};."]
+        print(f"打包帧采集器：{pm}")
+    else:
+        print("警告：PresentMon 缺失，打出的 exe 不带帧时间采集（其余功能不受影响）")
+
     cmd.append(str(ROOT / "app.py"))
 
     print("\n" + " ".join(cmd) + "\n")

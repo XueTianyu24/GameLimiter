@@ -18,12 +18,14 @@ from typing import Optional
 
 import psutil
 
-from . import changes, config, db, rules
+from . import changes, config, db, frames, hardware, rules
 from .config import LOG_PATH, POLL_INTERVAL, RULE_RELOAD_INTERVAL, WARN_MINUTES
 from .notifier import popup
 from .winutil import DAEMON_MUTEX, WATCHDOG_MUTEX, hold_mutex, mutex_exists, spawn_detached
 
 log = logging.getLogger("gamelimiter")
+
+SWEEP_INTERVAL = 3600.0     # 落盘数据清理间隔（秒）；启动时先扫一次，之后每小时一次
 
 
 def _setup_logging():
@@ -123,9 +125,139 @@ class Daemon:
         self.games: list[db.Game] = []
         self.daily_limit: Optional[int] = None       # 全局规则 d，随 reload_games 刷新
         self.active: dict[int, ActiveSession] = {}   # game_id -> ActiveSession
+        self.captures: dict[int, frames.Capture] = {}  # game_id -> 帧采集子进程
+        self.hw: dict[int, hardware.Sampler] = {}      # game_id -> 硬件采样器
+        self.jobs: dict[int, dict] = {}   # game_id -> {job_id, deadline}（手动采集任务）
         self.wake = threading.Event()
         self._last_reload = 0.0
         self._last_wd_spawn = 0.0
+        self._last_sweep = 0.0
+
+    # ---- 性能数据采集（旁路，异常一律不外溢） ----
+
+    def _start_capture(self, g: db.Game, sess: ActiveSession,
+                       procs: Optional[list] = None):
+        """会话开始时调用。
+
+        手动模式（v0.16.0 起的默认）**只在用户下过单时才采**——没下单就一个采集器都不起，
+        不占 CPU、不写盘。自动模式保持老行为：开游戏就采。
+        """
+        try:
+            job = db.armed_capture_job(self.conn, g.id, time.time())
+            if job is None and db.get_capture_mode(self.conn) != "auto":
+                return
+        except Exception:
+            log.exception("读采集任务异常（不影响限制）")
+            return
+        self._begin_capture(g, sess, procs, job)
+
+    def _begin_capture(self, g: db.Game, sess: ActiveSession,
+                       procs: Optional[list], job: Optional[dict]):
+        out_dir = job["out_dir"] if job else None
+        keep_raw = bool(job["keep_raw"]) if job else False
+        job_id = job["id"] if job else None
+        started = False
+        try:
+            cap = frames.start(self.conn, g, sess.session_id, sess.block_id,
+                               out_dir=out_dir, keep_raw=keep_raw, job_id=job_id)
+            if cap:
+                self.captures[g.id] = cap
+                started = True
+        except Exception:
+            log.exception("帧采集启动异常（不影响限制）")
+        try:
+            pid = procs[0].pid if procs else None
+            hw = hardware.start(self.conn, g, sess.session_id, sess.block_id, pid,
+                                out_dir=out_dir, job_id=job_id)
+            if hw:
+                self.hw[g.id] = hw
+                started = True
+        except Exception:
+            log.exception("硬件采集启动异常（不影响限制）")
+        if job is None:
+            return
+        if not started:
+            db.finish_capture_job(self.conn, job_id, "done", "两个采集器都没能启动")
+            log.warning("采集任务 %d：采集器没起来（帧采集多半是权限不够）", job_id)
+            return
+        now = time.time()
+        dur = job["duration_minutes"]
+        db.start_capture_job(self.conn, job_id, sess.session_id, int(now))
+        self.jobs[g.id] = {"job_id": job_id, "deadline": now + dur * 60 if dur else None}
+        log.info("采集任务 %d 开始：%s，%s，数据落 %s", job_id, g.name,
+                 f"{dur:g} 分钟" if dur else "采到游戏退出",
+                 out_dir or "默认目录")
+
+    def _stop_capture(self, game_id: int, note: str = ""):
+        """停采集。收尾一律走后台线程，绝不阻塞 tick
+        （帧数据聚合上百万行要几秒，卡在这里会让启动拦截失灵）。
+
+        **只停采集，不动会话**——采集时长到点时游戏照玩，限制规则那边毫不知情。
+        """
+        cap = self.captures.pop(game_id, None)
+        if cap is not None:
+            try:
+                frames.finalize_async(cap)
+            except Exception:
+                log.exception("帧采集收尾异常（不影响限制）")
+        hw = self.hw.pop(game_id, None)
+        if hw is not None:
+            try:
+                hardware.finalize_async(hw)
+            except Exception:
+                log.exception("硬件采集收尾异常（不影响限制）")
+        info = self.jobs.pop(game_id, None)
+        if info is not None:
+            try:
+                db.finish_capture_job(self.conn, info["job_id"], "done", note or "已结束")
+                log.info("采集任务 %d 结束（%s）", info["job_id"], note or "已结束")
+            except Exception:
+                log.exception("采集任务收尾异常（不影响限制）")
+
+    def _reap_dead_frame_captures(self):
+        """帧采集器自己先死了（权限不够 / 被杀 / 崩了）→ 只收掉它。
+
+        **不能顺手把硬件采集也停掉**：两个采集器互相独立，帧采集要管理员权限而硬件
+        采集不要，普通权限下前者必然起不来。早先这里一并调 `_stop_capture`，结果是
+        帧采集一失败，硬件数据也跟着断在第一秒（2026-08-13 e2e 抓到）。
+        """
+        for gid in [gid for gid, c in self.captures.items()
+                    if not c.alive() and gid in self.active]:
+            cap = self.captures.pop(gid)
+            log.warning("帧采集进程已提前退出（game_id=%d），本次不再采帧；"
+                        "硬件采集与采集任务继续", gid)
+            try:
+                frames.finalize_async(cap)
+            except Exception:
+                log.exception("帧采集收尾异常（不影响限制）")
+
+    def _tick_capture_jobs(self, now: float, procs: dict):
+        """采集任务的状态机。三件事：到点/被取消的停掉、待命超时的作废、
+        游戏已经在跑时才下的单立刻挂上。"""
+        for gid, info in list(self.jobs.items()):
+            dl = info["deadline"]
+            if dl and now >= dl:
+                self._stop_capture(gid, "采集时长到点")
+                continue
+            row = db.capture_job(self.conn, info["job_id"])
+            if row is not None and row["state"] == "cancelled":
+                self._stop_capture(gid, row["note"] or "手动停止")
+        db.expire_capture_jobs(self.conn, now)
+        for g in self.games:
+            sess = self.active.get(g.id)
+            if sess is None or g.id in self.jobs:
+                continue
+            job = db.armed_capture_job(self.conn, g.id, now)
+            if job is not None:
+                if g.id in self.captures or g.id in self.hw:
+                    # 自动模式已经在采了：让任务接管它（时长/停止按钮从此生效）
+                    db.start_capture_job(self.conn, job["id"], sess.session_id, int(now))
+                    dur = job["duration_minutes"]
+                    self.jobs[g.id] = {"job_id": job["id"],
+                                       "deadline": now + dur * 60 if dur else None}
+                    log.info("采集任务 %d 接管进行中的采集：%s", job["id"], g.name)
+                else:
+                    self._begin_capture(g, sess, procs.get(g.exe_name.lower()), job)
 
     # ---- 规则/名单 ----
 
@@ -161,6 +293,8 @@ class Daemon:
                     played_seconds=row["played_seconds"] or 0.0,
                     last_seen_ts=now)          # 空窗期不补计，从现在重新开始心跳
                 log.info(f"收养进行中会话：{g.name}（开始于 {_fmt(row['start_ts'])}）")
+                # 守护重启前的帧数据随旧进程一起没了，从现在重新起采
+                self._start_capture(g, self.active[g.id], alive)
             else:
                 db.close_session(self.conn, row["id"],
                                  int(row["last_seen_ts"] or row["start_ts"]), "daemon_restart")
@@ -168,6 +302,16 @@ class Daemon:
     # ---- 每轮处理 ----
 
     def _handle_start_attempt(self, g: db.Game, procs: list[psutil.Process], now: float):
+        # 观察模式：只开会话挂采集，一条规则都不查（PVP 游戏被强杀会判逃跑，
+        # 这条路径上必须连"算一下会不会被拦"都不做）
+        if rules.is_observed(g):
+            sid = db.open_session(self.conn, g.id, int(now))
+            sess = ActiveSession(sid, g.id, int(now), None, block_id=sid, last_seen_ts=now)
+            self.active[g.id] = sess
+            self._start_capture(g, sess, procs)
+            log.info(f"开始观察：{g.name}（观察模式，不施加任何限制）")
+            return
+
         # 上一段游玩还活着？活着 = 接着玩（额度接着用、跳过冷却），不是开新的一场
         block = db.current_block(self.conn, g.id)
         resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
@@ -199,6 +343,7 @@ class Daemon:
                              block_id=block_id or sid, carried_seconds=carried,
                              last_seen_ts=now)
         self.active[g.id] = sess
+        self._start_capture(g, sess, procs)
         dl = rules.session_deadline(g, now, carried, quota)
         head = "接着上一段玩" if resuming else "会话开始"
         log.info(f"{head}：{g.name}" + (f"（本段额度 {quota:g} 分钟）" if quota else "")
@@ -223,6 +368,7 @@ class Daemon:
             # 但守护空窗后重新扫到"进程已没了"时能差出几小时，那段不该算游玩、也不该推后冷却
             db.close_session(self.conn, sess.session_id, int(sess.last_seen_ts), "self_exit")
             del self.active[g.id]
+            self._stop_capture(g.id, "游戏已退出")
             played = sess.block_played / 60
             left = rules.block_remaining(g.session_minutes,
                                          {"limit_minutes": sess.limit_minutes,
@@ -248,6 +394,7 @@ class Daemon:
             db.close_session(self.conn, sess.session_id, int(now), reason)
             db.log_event(self.conn, g.id, "killed", reason)
             del self.active[g.id]
+            self._stop_capture(g.id, "游戏到点被关闭")
             log.info(f"到点终止：{g.name}（{reason}），终止 {n} 个进程")
             popup(f"GameLimiter — {g.name} 已关闭", rules.REASON_TEXT[reason])
             return
@@ -302,11 +449,33 @@ class Daemon:
         for gid in [gid for gid in self.active if gid not in enabled_ids]:
             db.close_session(self.conn, self.active[gid].session_id, int(now), "disabled")
             del self.active[gid]
+            self._stop_capture(gid, "游戏已停用")
+        self._reap_dead_frame_captures()
+        try:
+            self._tick_capture_jobs(now, procs)
+        except Exception:
+            log.exception("采集任务处理异常（不影响限制）")
+        self._sweep(now)
+
+    def _sweep(self, now: float):
+        """周期清理落盘数据。**不能只在启动时扫**：守护常驻不重启时，崩在采集中途
+        留下的几百 MB 孤儿文件会一直躺着（watchdog 10 秒就复活，那时文件还太新）。"""
+        if now - self._last_sweep < SWEEP_INTERVAL:
+            return
+        self._last_sweep = now
+        frames.sweep_stale(exclude=[c.csv_path for c in self.captures.values()])
+        hardware.sweep_old()
 
     def run(self):
         db.log_event(self.conn, None, "daemon_start")
         log.info(f"守护进程启动，DB: {self.conn.execute('PRAGMA database_list').fetchone()[2]}")
         self.reload_games()
+        self._last_sweep = time.time()
+        frames.sweep_stale()        # 清掉崩溃/断电留下的孤儿 CSV（单次可达数百 MB）
+        hardware.sweep_old()        # 硬件采样只留最近 N 次（每次几百 KB，留着供事后分析）
+        n = db.abandon_running_capture_jobs(self.conn)
+        if n:
+            log.warning("%d 个采集任务随上次守护退出中断，已标记结束", n)
         self.adopt_sessions()
         threading.Thread(target=_wmi_watcher, args=(self.exe_names, self.wake),
                          daemon=True).start()

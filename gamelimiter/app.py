@@ -25,9 +25,10 @@ def _selftest():
     import sqlite3  # noqa: F401
     import psutil  # noqa: F401
     from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
-    from . import (changes, cli, daemon, db, gui, icons, rules,  # noqa: F401
-                   setup_system, stats, steam, tray, updater, version, watchdog)
+    from . import (changes, cli, daemon, db, frames, gui, hardware, icons,  # noqa: F401
+                   rules, setup_system, stats, steam, tray, updater, version, watchdog)
     print("selftest OK")
+    print("presentmon: " + str(frames.presentmon_path() or "MISSING"))
 
 
 def _stop_daemon():

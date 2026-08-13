@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS games (
     next_session_minutes REAL,-- 下次会话的一次性额度（≤上限），守护开会话时消费；NULL=用满上限
     windows TEXT,             -- 规则c 允许时段，JSON 数组 ["19:00-23:00"]，NULL=不限
     icon TEXT,                -- 从 exe 提取的 PNG data URI，NULL=没取到（GUI 退回首字母块）
+    monitor_only INTEGER NOT NULL DEFAULT 0,  -- 观察模式：只采集帧/硬件数据，不施加任何限制，
+                              -- 也不占「每天最多玩几款」的名额。给 PVP 这类强杀会判逃跑的游戏用
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -50,6 +52,31 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,     -- 全局设置（跨游戏），目前只有 daily_game_limit
     value TEXT                -- NULL = 未设/不限
 );
+CREATE TABLE IF NOT EXISTS frame_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,   -- 一次进程运行对应一条（一段游玩可含多条）
+    game_id INTEGER NOT NULL,
+    block_id INTEGER,              -- 冗余存一份，按段聚合时免去 join sessions
+    start_ts INTEGER NOT NULL,
+    end_ts INTEGER,
+    frames INTEGER,                -- 采到的帧数；0 = 挂上了但没采到（如游戏没渲染就退了）
+    seconds REAL,                  -- 采样覆盖的秒数
+    status TEXT,                   -- ok / no_frames / truncated / failed
+    summary TEXT                   -- JSON 摘要：分位数 / 瓶颈 / 画面模式 / 每分钟趋势
+);
+CREATE INDEX IF NOT EXISTS idx_frame_runs_game ON frame_runs(game_id, id DESC);
+CREATE TABLE IF NOT EXISTS hw_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    game_id INTEGER NOT NULL,
+    block_id INTEGER,
+    start_ts INTEGER NOT NULL,
+    end_ts INTEGER,
+    samples INTEGER,               -- 1Hz 采样点数
+    csv_path TEXT,                 -- 原始逐秒 CSV（**保留**，两小时才约 700KB，供事后分析）
+    summary TEXT                   -- JSON：CPU/内存/磁盘/GPU 分位数 + 干扰进程 + 异常标记
+);
+CREATE INDEX IF NOT EXISTS idx_hw_runs_game ON hw_runs(game_id, id DESC);
 CREATE TABLE IF NOT EXISTS pending_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     game_id INTEGER NOT NULL,
@@ -59,6 +86,21 @@ CREATE TABLE IF NOT EXISTS pending_changes (
     created_at INTEGER NOT NULL,
     UNIQUE(game_id, field)
 );
+CREATE TABLE IF NOT EXISTS capture_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id INTEGER NOT NULL,
+    duration_minutes REAL,         -- 采多久；NULL = 一直采到游戏退出
+    out_dir TEXT,                  -- 数据落脚目录；NULL = 默认数据目录
+    keep_raw INTEGER NOT NULL DEFAULT 1,  -- 保留原始帧 CSV（手动采集默认留，一小时约 260MB）
+    state TEXT NOT NULL,           -- armed（待命）/ running / done / cancelled / expired
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,   -- 待命超时：这么久还没等到游戏开就作废
+    session_id INTEGER,            -- 实际挂上的会话
+    started_ts INTEGER,
+    ended_ts INTEGER,
+    note TEXT                      -- 结束原因（到点 / 游戏退出 / 手动停止 / 失败原因）
+);
+CREATE INDEX IF NOT EXISTS idx_capture_jobs_game ON capture_jobs(game_id, id DESC);
 """
 
 
@@ -75,6 +117,7 @@ class Game:
     icon: Optional[str] = None
     next_session_minutes: Optional[float] = None
     next_allowed_date: Optional[str] = None    # 'YYYY-MM-DD'
+    monitor_only: bool = False                 # 只观察不限制
 
 
 # 老库补列：(表, 列, 类型)。ALTER 幂等靠 duplicate column 异常兜底——守护与 GUI
@@ -85,7 +128,8 @@ _MIGRATIONS = [("games", "icon", "TEXT"),
                ("sessions", "limit_minutes", "REAL"),
                ("sessions", "block_id", "INTEGER"),
                ("sessions", "played_seconds", "REAL"),
-               ("sessions", "last_seen_ts", "INTEGER")]
+               ("sessions", "last_seen_ts", "INTEGER"),
+               ("games", "monitor_only", "INTEGER NOT NULL DEFAULT 0")]
 
 
 def _migrate(conn):
@@ -115,6 +159,7 @@ def _row_to_game(r: sqlite3.Row) -> Game:
         enabled=bool(r["enabled"]), icon=r["icon"],
         next_session_minutes=r["next_session_minutes"],
         next_allowed_date=r["next_allowed_date"],
+        monitor_only=bool(r["monitor_only"]),
     )
 
 
@@ -164,7 +209,7 @@ def set_next_session(conn, game_id: int, minutes: Optional[float]):
 def update_rules(conn, game_id: int, **fields):
     """fields 可含 cooldown_hours / next_allowed_date / session_minutes / windows / enabled / name。"""
     allowed = {"cooldown_hours", "next_allowed_date", "session_minutes",
-               "windows", "enabled", "name"}
+               "windows", "enabled", "name", "monitor_only"}
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:
@@ -282,9 +327,201 @@ def current_block(conn, game_id: int) -> Optional[dict]:
     }
 
 
+# ---- 帧时间采集 ----
+
+def insert_frame_run(conn, session_id: int, game_id: int, block_id: Optional[int],
+                     start_ts: int, end_ts: int, summary: dict, status: str) -> int:
+    cur = conn.execute(
+        """INSERT INTO frame_runs (session_id, game_id, block_id, start_ts, end_ts,
+                                   frames, seconds, status, summary)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (session_id, game_id, block_id, start_ts, end_ts,
+         summary.get("frames") or 0, summary.get("seconds") or 0.0,
+         status, json.dumps(summary, ensure_ascii=False) if summary else None))
+    conn.commit()
+    return cur.lastrowid
+
+
+def frame_runs(conn, game_id: Optional[int] = None, limit: int = 20) -> list[sqlite3.Row]:
+    if game_id is None:
+        return conn.execute("SELECT * FROM frame_runs ORDER BY id DESC LIMIT ?",
+                            (limit,)).fetchall()
+    return conn.execute("SELECT * FROM frame_runs WHERE game_id=? ORDER BY id DESC LIMIT ?",
+                        (game_id, limit)).fetchall()
+
+
+def frame_runs_of_block(conn, block_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM frame_runs WHERE block_id=? AND frames>0 ORDER BY id", (block_id,)).fetchall()
+
+
+def block_frame_summary(conn, block_id: int) -> Optional[dict]:
+    """一段游玩的帧摘要：段内多次进程运行按帧数加权合并。
+
+    分位数无法真正合并（只有摘要没有原始帧），所以按帧数加权取近似——
+    段内各次运行的画质设置通常一致，加权平均够用；只有一条时就是精确值。
+    """
+    rows = frame_runs_of_block(conn, block_id)
+    if not rows:
+        return None
+    from . import frames as _frames
+    parts = [(r, _frames.load_summary(r)) for r in rows]
+    parts = [(r, s) for r, s in parts if s.get("frames")]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0][1]
+    total = sum(s["frames"] for _, s in parts)
+    out = dict(parts[0][1])
+
+    def wavg(key):
+        vals = [(s.get(key), s["frames"]) for _, s in parts if s.get(key) is not None]
+        return round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 2) if vals else None
+
+    for k in ("fps_avg", "fps_low1", "fps_low01", "ft_p50", "ft_p95", "ft_p99",
+              "cpu_busy_p50", "gpu_busy_p50", "gpu_wait_p50", "judder_pct",
+              "generated_pct", "click_to_photon_p50"):
+        v = wavg(k)
+        if v is not None:
+            out[k] = v
+    out["frames"] = total
+    out["seconds"] = round(sum(s.get("seconds") or 0 for _, s in parts), 1)
+    out["hitches"] = sum(s.get("hitches") or 0 for _, s in parts)
+    out["ft_max"] = max(s.get("ft_max") or 0 for _, s in parts)
+    secs = out["seconds"]
+    out["hitches_per_min"] = round(out["hitches"] / (secs / 60.0), 2) if secs >= 1 else 0.0
+    out["runs"] = len(parts)
+    out.pop("per_minute", None)          # 跨次运行的时间轴接不起来，段级不给趋势
+    return out
+
+
+# ---- 硬件采集 ----
+
+def insert_hw_run(conn, session_id: int, game_id: int, block_id: Optional[int],
+                  start_ts: int, end_ts: int, samples: int, csv_path: str,
+                  summary: dict) -> int:
+    cur = conn.execute(
+        """INSERT INTO hw_runs (session_id, game_id, block_id, start_ts, end_ts,
+                                samples, csv_path, summary)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (session_id, game_id, block_id, start_ts, end_ts, samples, csv_path,
+         json.dumps(summary, ensure_ascii=False) if summary else None))
+    conn.commit()
+    return cur.lastrowid
+
+
+def hw_runs(conn, game_id: Optional[int] = None, limit: int = 20) -> list[sqlite3.Row]:
+    if game_id is None:
+        return conn.execute("SELECT * FROM hw_runs ORDER BY id DESC LIMIT ?",
+                            (limit,)).fetchall()
+    return conn.execute("SELECT * FROM hw_runs WHERE game_id=? ORDER BY id DESC LIMIT ?",
+                        (game_id, limit)).fetchall()
+
+
+# ---- 采集任务（手动采集：GUI/CLI 下单，守护接单）----
+#
+# 守护是 SYSTEM 身份的独立进程，GUI 是用户身份的另一个进程，两边只能靠这张表通信：
+# GUI 写一条 armed 记录，守护下一轮（≤1 秒）读到就挂采集器。
+# 状态流转：armed →（游戏在跑）running →（到点 / 游戏退出 / 手动停）done
+#           armed →（超时没等到游戏）expired；armed/running →（用户取消）cancelled
+
+CAPTURE_STATES_ACTIVE = ("armed", "running")
+
+
+def create_capture_job(conn, game_id: int, duration_minutes: Optional[float],
+                       out_dir: Optional[str], keep_raw: bool, expires_at: int) -> int:
+    """下一单采集。同一游戏同时只留一条活跃任务——新的顶掉旧的待命任务。"""
+    now = int(time.time())
+    conn.execute(
+        """UPDATE capture_jobs SET state='cancelled', ended_ts=?, note='被新任务顶替'
+           WHERE game_id=? AND state='armed'""", (now, game_id))
+    cur = conn.execute(
+        """INSERT INTO capture_jobs (game_id, duration_minutes, out_dir, keep_raw,
+                                     state, created_at, expires_at)
+           VALUES (?,?,?,?,'armed',?,?)""",
+        (game_id, duration_minutes, out_dir or None, int(bool(keep_raw)), now, int(expires_at)))
+    conn.commit()
+    return cur.lastrowid
+
+
+def armed_capture_job(conn, game_id: int, now: float) -> Optional[sqlite3.Row]:
+    """该游戏待命中且没过期的采集任务。守护每轮查它决定要不要挂采集器。"""
+    return conn.execute(
+        """SELECT * FROM capture_jobs WHERE game_id=? AND state='armed' AND expires_at>?
+           ORDER BY id DESC LIMIT 1""", (game_id, int(now))).fetchone()
+
+
+def active_capture_job(conn, game_id: int) -> Optional[sqlite3.Row]:
+    """待命中或正在采的任务（给 GUI 显示状态用）。"""
+    return conn.execute(
+        """SELECT * FROM capture_jobs WHERE game_id=? AND state IN ('armed','running')
+           ORDER BY id DESC LIMIT 1""", (game_id,)).fetchone()
+
+
+def capture_job(conn, job_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM capture_jobs WHERE id=?", (job_id,)).fetchone()
+
+
+def start_capture_job(conn, job_id: int, session_id: int, started_ts: int):
+    conn.execute(
+        """UPDATE capture_jobs SET state='running', session_id=?, started_ts=?
+           WHERE id=? AND state='armed'""", (session_id, started_ts, job_id))
+    conn.commit()
+
+
+def finish_capture_job(conn, job_id: int, state: str = "done", note: str = ""):
+    conn.execute(
+        """UPDATE capture_jobs SET state=?, ended_ts=?, note=?
+           WHERE id=? AND state IN ('armed','running')""",
+        (state, int(time.time()), note or None, job_id))
+    conn.commit()
+
+
+def cancel_capture_job(conn, job_id: int, note: str = "手动停止") -> bool:
+    """用户按下"停止采集"。running 的任务由守护下一轮看到状态变化后收尾。"""
+    cur = conn.execute(
+        """UPDATE capture_jobs SET state='cancelled', ended_ts=?, note=?
+           WHERE id=? AND state IN ('armed','running')""",
+        (int(time.time()), note, job_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def expire_capture_jobs(conn, now: float) -> int:
+    """待命超时的任务作废——点了采集却一直没开游戏，不该几天后突然采一场。"""
+    cur = conn.execute(
+        """UPDATE capture_jobs SET state='expired', ended_ts=?, note='一直没等到游戏启动'
+           WHERE state='armed' AND expires_at<=?""", (int(now), int(now)))
+    conn.commit()
+    return cur.rowcount
+
+
+def abandon_running_capture_jobs(conn) -> int:
+    """守护启动时清理上次留下的 running 任务。
+
+    守护崩了/被杀时采集器跟着没了，那条任务永远等不到收尾。不改成"接着采"是因为
+    数据已经断成两截、时长也对不上——如实标记中断，让用户自己决定要不要重采。
+    """
+    cur = conn.execute(
+        """UPDATE capture_jobs SET state='done', ended_ts=?, note='守护重启，采集中断'
+           WHERE state='running'""", (int(time.time()),))
+    conn.commit()
+    return cur.rowcount
+
+
+def capture_jobs(conn, game_id: Optional[int] = None, limit: int = 20) -> list[sqlite3.Row]:
+    if game_id is None:
+        return conn.execute("SELECT * FROM capture_jobs ORDER BY id DESC LIMIT ?",
+                            (limit,)).fetchall()
+    return conn.execute("SELECT * FROM capture_jobs WHERE game_id=? ORDER BY id DESC LIMIT ?",
+                        (game_id, limit)).fetchall()
+
+
 # ---- 全局设置 ----
 
 DAILY_GAME_LIMIT = "daily_game_limit"
+CAPTURE_MODE = "capture_mode"          # manual（默认）= 点了才采；auto = 开游戏就采
+CAPTURE_OUT_DIR = "capture_out_dir"    # 上次用的存放目录，作为下次下单的默认值
 
 
 def get_setting(conn, key: str) -> Optional[str]:
@@ -309,17 +546,42 @@ def set_daily_game_limit(conn, n: Optional[int]):
     set_setting(conn, DAILY_GAME_LIMIT, int(n) if n else None)
 
 
+def get_capture_mode(conn) -> str:
+    """'manual'（默认）= 只有下单了才采；'auto' = 开游戏就自动采（v0.16.0 之前的行为）。
+
+    老库没有这个键 → 按 manual 走。这是 v0.16.0 的**行为变更**：升级后不点采集就没数据。
+    """
+    v = get_setting(conn, CAPTURE_MODE)
+    return "auto" if v == "auto" else "manual"
+
+
+def set_capture_mode(conn, mode: str):
+    if mode not in ("manual", "auto"):
+        raise ValueError(f"unknown capture mode {mode}")
+    set_setting(conn, CAPTURE_MODE, mode)
+
+
+def get_capture_out_dir(conn) -> Optional[str]:
+    return get_setting(conn, CAPTURE_OUT_DIR) or None
+
+
+def set_capture_out_dir(conn, path: Optional[str]):
+    set_setting(conn, CAPTURE_OUT_DIR, (path or "").strip() or None)
+
+
 def games_played_between(conn, start_ts: float, end_ts: float,
                          now_ts: Optional[float] = None) -> dict[int, str]:
     """与 [start, end) 有交集的会话涉及的游戏 {id: 名称}。
 
     跨午夜的会话两头都算——凌晨 1 点还在玩，那它就占今天一个名额。
     进行中的会话（end_ts 为 NULL）按"到此刻为止"算，否则查未来区间时它会一直命中。
+    **观察模式的游戏不计入**——它本就不受任何限制，占名额会把别的游戏挤掉。
     """
     now_ts = time.time() if now_ts is None else now_ts
     rows = conn.execute(
         """SELECT DISTINCT s.game_id, g.name FROM sessions s JOIN games g ON g.id=s.game_id
-           WHERE s.start_ts < ? AND COALESCE(s.end_ts, ?) > ?""",
+           WHERE s.start_ts < ? AND COALESCE(s.end_ts, ?) > ?
+             AND COALESCE(g.monitor_only, 0) = 0""",
         (int(end_ts), int(now_ts), int(start_ts)))
     return {r["game_id"]: r["name"] for r in rows}
 
