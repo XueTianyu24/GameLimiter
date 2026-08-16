@@ -110,7 +110,8 @@ def _playing_text(conn) -> str:
             continue
         block = db.current_block(conn, g.id)
         dl = rules.session_deadline(g, now, block["played_seconds"] if block else 0.0,
-                                    row["limit_minutes"])
+                                    row["limit_minutes"],
+                                    daily_remaining=db.daily_remaining_seconds(conn, now))
         return (f"{g.name} 剩 {max(0, (dl[0] - now) / 60):.0f} 分钟" if dl
                 else f"{g.name} 游玩中")
     return ""

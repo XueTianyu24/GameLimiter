@@ -6,7 +6,9 @@
 (b) session_minutes  单次最长时长（上限）：一段游玩累计**真实在跑**多少分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
 (d) daily_game_limit **全局**：一天内最多玩几款不同的游戏（不挂在单个游戏上）
+(e) daily_minutes    **全局**：一天内所有游戏加起来最多玩多少分钟（跨游戏总额）
 a/b/c 三条按游戏配置、可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
+d/e 两条是全局的：d 管"开几款"，e 管"总共玩多久"——只限款数挡不住每款都玩到天亮。
 
 规则 b 是**上限**：每次会话可另给一个"本次额度"（`limit_minutes`），与上限取更严者。
 额度只能收紧不能放宽——这是防冲动的核心，见 `changes.set_next_session`。
@@ -87,6 +89,25 @@ def check_daily_limit(limit: Optional[int], today: dict, game_id: int,
     return StartVerdict(False, "daily_game_limit",
                         f"今天已经玩过 {len(today)} 款（{names}），达到每天最多 {limit} 款的上限；"
                         f"这款今天还没玩过，明天 0:00 后可以开", tomorrow)
+
+
+def check_daily_minutes(limit_minutes: Optional[float], used_seconds: float,
+                        now_ts: float) -> StartVerdict:
+    """全局规则 (e)：一天内所有游戏加起来最多玩多少分钟。
+
+    `used_seconds` = 今天已经玩掉的**真实在跑**秒数（跨游戏累加，见 `db.daily_used_seconds`）。
+    与规则 d 不同，这条对"今天已经玩过的那款"照样生效——总额用完就是用完了，
+    换回第一款游戏接着玩正是要拦的事。
+    """
+    if not limit_minutes:
+        return StartVerdict(True)
+    if used_seconds < limit_minutes * 60:
+        return StartVerdict(True)
+    _, tomorrow = day_bounds(now_ts)
+    return StartVerdict(False, "daily_minutes",
+                        f"今天所有游戏加起来已玩 {used_seconds/60:.0f} 分钟，"
+                        f"达到每天总时长上限 {limit_minutes:g} 分钟；明天 0:00 后额度重置",
+                        tomorrow)
 
 
 WEEKDAY_ZH = "一二三四五六日"
@@ -191,12 +212,15 @@ def block_remaining(cap_minutes: Optional[float], block: Optional[dict]) -> Opti
 
 
 def session_deadline(game: Game, now_ts: float, played_seconds: float = 0.0,
-                     limit_minutes: Optional[float] = None) -> Optional[tuple[float, str]]:
-    """运行中会话的最早强制截止 (deadline_ts, reason)；无 b/c 规则返回 None。
+                     limit_minutes: Optional[float] = None,
+                     daily_remaining: Optional[float] = None) -> Optional[tuple[float, str]]:
+    """运行中会话的最早强制截止 (deadline_ts, reason)；无 b/c/e 规则返回 None。
 
     时长按**这一段累计的真实游玩秒数** `played_seconds` 算剩余，不按会话开始的墙钟——
     中途退出的时间不该被计入，守护没观测到的空窗期也不该（见 `config.HEARTBEAT_MAX_GAP`）。
     `limit_minutes` = 本段额度，与游戏上限取更严者。
+    `daily_remaining` = 今日总时长还剩多少秒（规则 e），None = 没设这条规则。
+    走 deadline 而不是直接杀，是为了让它复用现有的多级预警倒计时——PVP 被无预警强杀会判逃跑。
     时段规则：若 now 已在时段外（时段中途结束/规则收紧），deadline=now 立即到点。
     """
     if is_observed(game):
@@ -208,6 +232,8 @@ def session_deadline(game: Game, now_ts: float, played_seconds: float = 0.0,
     if game.windows:
         end = current_window_end(game.windows, datetime.fromtimestamp(now_ts))
         cands.append((end.timestamp(), "window_end") if end else (now_ts, "window_end"))
+    if daily_remaining is not None:
+        cands.append((now_ts + max(0.0, daily_remaining), "daily_minutes"))
     return min(cands) if cands else None
 
 
@@ -226,4 +252,5 @@ def coverage(windows: Optional[list[str]]) -> frozenset[int]:
 REASON_TEXT = {
     "session_timeout": "本次游玩时长已到",
     "window_end": "允许时段已结束",
+    "daily_minutes": "今天的游玩总时长已用完",
 }

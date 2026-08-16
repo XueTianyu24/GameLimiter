@@ -48,8 +48,9 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,       -- blocked / killed / warn / daemon_start ...
     detail TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_ts);
 CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,     -- 全局设置（跨游戏），目前只有 daily_game_limit
+    key TEXT PRIMARY KEY,     -- 全局设置（跨游戏）：daily_game_limit / daily_minutes / 采集开关
     value TEXT                -- NULL = 未设/不限
 );
 CREATE TABLE IF NOT EXISTS frame_runs (
@@ -520,6 +521,7 @@ def capture_jobs(conn, game_id: Optional[int] = None, limit: int = 20) -> list[s
 # ---- 全局设置 ----
 
 DAILY_GAME_LIMIT = "daily_game_limit"
+DAILY_MINUTES = "daily_minutes"        # 规则 e：一天内所有游戏加起来最多玩多少分钟
 CAPTURE_MODE = "capture_mode"          # manual（默认）= 点了才采；auto = 开游戏就采
 CAPTURE_OUT_DIR = "capture_out_dir"    # 上次用的存放目录，作为下次下单的默认值
 
@@ -544,6 +546,16 @@ def get_daily_game_limit(conn) -> Optional[int]:
 
 def set_daily_game_limit(conn, n: Optional[int]):
     set_setting(conn, DAILY_GAME_LIMIT, int(n) if n else None)
+
+
+def get_daily_minutes(conn) -> Optional[float]:
+    """一天内所有游戏加起来最多玩多少分钟；None = 不限。"""
+    v = get_setting(conn, DAILY_MINUTES)
+    return float(v) if v else None
+
+
+def set_daily_minutes(conn, minutes: Optional[float]):
+    set_setting(conn, DAILY_MINUTES, float(minutes) if minutes else None)
 
 
 def get_capture_mode(conn) -> str:
@@ -584,6 +596,49 @@ def games_played_between(conn, start_ts: float, end_ts: float,
              AND COALESCE(g.monitor_only, 0) = 0""",
         (int(end_ts), int(now_ts), int(start_ts)))
     return {r["game_id"]: r["name"] for r in rows}
+
+
+def played_seconds_between(conn, start_ts: float, end_ts: float,
+                           now_ts: Optional[float] = None) -> float:
+    """[start, end) 区间内的**真实在跑**游玩秒数，跨游戏累加（规则 e 的分母）。
+
+    口径与规则 b 一致：用心跳累计的 `played_seconds`，不是墙钟差——中途退出的时间、
+    守护没观测到的空窗期都不算。**观察模式的游戏不计入**（与规则 d 一致：它本就不受
+    任何限制，让它吃掉总额会把别的游戏挤没）。
+
+    跨午夜的会话按**墙钟重叠比例分摊**到两天。这是近似——真实游玩秒数没有按分钟落库的
+    时间轴，只有一个总数，没法精确切分。误差只发生在"跨零点那一场"，且只有中途退出过
+    才会偏；为此加一张逐分钟表不值当。
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    rows = conn.execute(
+        """SELECT s.start_ts, s.end_ts, s.played_seconds
+           FROM sessions s JOIN games g ON g.id=s.game_id
+           WHERE s.start_ts < ? AND COALESCE(s.end_ts, ?) > ?
+             AND COALESCE(g.monitor_only, 0) = 0""",
+        (int(end_ts), int(now_ts), int(start_ts)))
+    total = 0.0
+    for r in rows:
+        s_end = r["end_ts"] if r["end_ts"] is not None else now_ts
+        span = max(1.0, s_end - r["start_ts"])
+        overlap = max(0.0, min(s_end, end_ts) - max(r["start_ts"], start_ts))
+        total += session_played(r) * min(1.0, overlap / span)
+    return total
+
+
+def daily_used_seconds(conn, now_ts: Optional[float] = None) -> float:
+    """今天（自然日）已经玩掉的总秒数。"""
+    from . import rules                     # 延迟导入：rules 依赖 db.Game，顶层导入会成环
+    now_ts = time.time() if now_ts is None else now_ts
+    return played_seconds_between(conn, *rules.day_bounds(now_ts), now_ts)
+
+
+def daily_remaining_seconds(conn, now_ts: Optional[float] = None) -> Optional[float]:
+    """今天的总时长还剩多少秒；没设规则 e 返回 None（此时**不查库**）。"""
+    limit = get_daily_minutes(conn)
+    if not limit:
+        return None
+    return max(0.0, limit * 60 - daily_used_seconds(conn, now_ts))
 
 
 # ---- 待生效变更（规则放宽延迟）----

@@ -62,9 +62,14 @@ def cmd_add(conn, a):
 
 def cmd_list(conn, a):
     games = db.list_games(conn)
+    now = time.time()
     limit = db.get_daily_game_limit(conn)
-    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
-    print(f"全局：每天最多玩 {f'{limit} 款' if limit else '不限'}；今天已玩 {len(today)} 款")
+    minutes = db.get_daily_minutes(conn)
+    today = db.games_played_between(conn, *rules.day_bounds(now))
+    used = db.daily_used_seconds(conn, now) / 60
+    print(f"全局：每天最多玩 {f'{limit} 款' if limit else '不限'}"
+          f"、总时长 {f'{minutes:g} 分钟' if minutes else '不限'}；"
+          f"今天已玩 {len(today)} 款 / {used:.0f} 分钟")
     if not games:
         print("（无受限游戏）")
         return
@@ -151,18 +156,26 @@ def cmd_next(conn, a):
 
 
 def cmd_daily(conn, a):
-    """全局：一天内最多玩几款不同的游戏。不给值=查看，off=取消。"""
-    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
-    if a.count is None:
-        limit = db.get_daily_game_limit(conn)
-        print(f"每天最多玩：{f'{limit} 款' if limit else '不限'}；"
-              f"今天已玩 {len(today)} 款" + (f"（{'、'.join(today.values())}）" if today else ""))
-        for p in changes.global_pendings(conn):
-            print(f"  [{p['id']}] 待生效：{changes.describe_pending(p)}")
+    """全局每日规则：最多几款（位置参数）+ 总时长上限（--minutes）。不给值=查看。"""
+    now = time.time()
+    if a.minutes is not None:
+        print(changes.request_daily_minutes(conn, _num_or_off(a.minutes))[2] or "无变化")
+    if a.count is not None:
+        print(changes.request_daily_limit(conn, _num_or_off(a.count))[2] or "无变化")
+    if a.count is not None or a.minutes is not None:
         return
-    v = _num_or_off(a.count)
-    status, _, msg = changes.request_daily_limit(conn, v)
-    print(msg or "无变化")
+
+    today = db.games_played_between(conn, *rules.day_bounds(now))
+    limit = db.get_daily_game_limit(conn)
+    print(f"每天最多玩：{f'{limit} 款' if limit else '不限'}；"
+          f"今天已玩 {len(today)} 款" + (f"（{'、'.join(today.values())}）" if today else ""))
+    minutes = db.get_daily_minutes(conn)
+    used = db.daily_used_seconds(conn, now) / 60
+    print(f"每天总时长：{f'{minutes:g} 分钟' if minutes else '不限'}；"
+          f"今天已玩 {used:.0f} 分钟"
+          + (f"，还剩 {max(0.0, minutes - used):.0f} 分钟" if minutes else ""))
+    for p in changes.global_pendings(conn):
+        print(f"  [{p['id']}] 待生效：{changes.describe_pending(p)}")
 
 
 def cmd_remove(conn, a):
@@ -426,8 +439,10 @@ def main():
     p.add_argument("minutes", nargs="?", default=None, help="分钟数或 off；留空=查看")
     p.set_defaults(fn=cmd_next)
 
-    p = sub.add_parser("daily", help="全局：每天最多玩几款游戏（调小即时，调大延迟 24h）")
+    p = sub.add_parser("daily", help="全局每日规则：最多几款 + 总时长（调小即时，调大延迟 24h）")
     p.add_argument("count", nargs="?", default=None, help="款数或 off；留空=查看")
+    p.add_argument("--minutes", default=None,
+                   help="每天所有游戏加起来最多玩多少分钟，或 off")
     p.set_defaults(fn=cmd_daily)
 
     p = sub.add_parser("remove", help="删除游戏")

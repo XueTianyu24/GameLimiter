@@ -39,7 +39,8 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
         return "已停用（不受限制）", "bg-gray-100 text-gray-500", "", bool(sess)
     if sess:
         played = block["played_seconds"] if block else 0.0
-        dl = rules.session_deadline(g, now, played, sess["limit_minutes"])
+        dl = rules.session_deadline(g, now, played, sess["limit_minutes"],
+                                    daily_remaining=db.daily_remaining_seconds(conn, now))
         note = f"本段已玩 {played/60:.0f} 分钟"
         if block and block["sessions"] > 1:
             note += f"（分 {block['sessions']} 次）"
@@ -54,7 +55,11 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
 
     # 上一段还没玩完 → 现在再打开是"接着玩"，用剩下的额度，不查冷却
     resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
-    v = rules.check_start(g, db.last_session_end(conn, g.id), now, resuming=resuming)
+    # 全局总时长用完时每张卡片都该照实说，而不是各自显示"现在可玩"
+    daily_cap, daily_used = db.get_daily_minutes(conn), db.daily_used_seconds(conn, now)
+    daily = rules.check_daily_minutes(daily_cap, daily_used, now)
+    v = (rules.check_start(g, db.last_session_end(conn, g.id), now, resuming=resuming)
+         if daily.allowed else daily)
     cap_txt = f"单次最长 {g.session_minutes:g} 分钟" if g.session_minutes else "单次时长不限"
     if v.allowed and resuming:
         left = rules.block_remaining(g.session_minutes, block)
@@ -68,6 +73,10 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
                  if g.next_session_minutes else
                  (cap_txt if g.session_minutes else ""))
         return "现在可玩", "bg-green-100 text-green-700", extra, False
+    if v.reason == "daily_minutes":
+        return ("今日总时长已用完 · 明天 0:00 重置", "bg-rose-100 text-rose-700",
+                f"今天所有游戏加起来已玩 {daily_used/60:.0f} 分钟"
+                f"（上限 {daily_cap:g} 分钟）", False)
     if v.reason == "locked_until_date":
         u = datetime.fromtimestamp(v.unlock_ts)
         days = (u.date() - datetime.fromtimestamp(now).date()).days
@@ -512,11 +521,14 @@ def backfill_icons(games: list[db.Game]) -> bool:
 
 @ui.refreshable
 def global_rule_view():
-    """全局规则 d：每天最多玩几款游戏（不挂在单个游戏卡片上）。"""
+    """全局规则 d（每天最多玩几款）+ e（每天游玩总时长），不挂在单个游戏卡片上。"""
     if not db.list_games(conn):
         return
+    now = time.time()
     limit = db.get_daily_game_limit(conn)
-    today = db.games_played_between(conn, *rules.day_bounds(time.time()))
+    minutes = db.get_daily_minutes(conn)
+    used = db.daily_used_seconds(conn, now) / 60
+    today = db.games_played_between(conn, *rules.day_bounds(now))
     with ui.card().classes("w-full rounded-2xl shadow-sm p-3 gap-1 bg-white"):
         with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
             ui.icon("today").classes("text-xl text-sky-500")
@@ -545,6 +557,35 @@ def global_rule_view():
             games_view.refresh()
         n.on("blur", save_limit)
         n.on("keydown.enter", save_limit)
+
+        with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+            ui.icon("hourglass_bottom").classes("text-xl text-sky-500")
+            ui.label("每天总共玩").classes("text-sm text-slate-600 shrink-0")
+            m = ui.number(value=minutes, min=0, step=10, placeholder="不限") \
+                .classes("w-[84px]").props("dense") \
+                .tooltip("所有游戏加起来一天最多玩多少分钟；空 = 不限。"
+                         "用完后正在玩的那局也会走预警倒计时后关闭。调小立即生效，调大延迟 24 小时")
+            ui.label("分钟").classes("text-sm text-slate-600 shrink-0")
+            if minutes:
+                left = max(0.0, minutes - used)
+                ui.label(f"· 今天已玩 {used:.0f} 分钟，还剩 {left:.0f} 分钟"
+                         + ("（已用满，今天都打不开了）" if left <= 0 else "")) \
+                    .classes("text-xs " + ("text-amber-600" if left <= 0 else "text-slate-400"))
+            else:
+                ui.label(f"· 今天已玩 {used:.0f} 分钟").classes("text-xs text-slate-400")
+            ui.space()
+            ui.button("不限", on_click=lambda: (m.set_value(None), save_minutes())) \
+                .props("flat dense size=sm color=grey")
+
+        def save_minutes(m=m):
+            status, _, msg = changes.request_daily_minutes(conn, m.value)
+            if status == "nochange":
+                return
+            ui.notify(msg, type="positive" if status == "applied" else "warning")
+            global_rule_view.refresh()
+            games_view.refresh()
+        m.on("blur", save_minutes)
+        m.on("keydown.enter", save_minutes)
 
         for p in changes.global_pendings(conn):
             with ui.row().classes("w-full items-center gap-1"):

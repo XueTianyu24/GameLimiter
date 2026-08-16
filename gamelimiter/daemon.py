@@ -64,6 +64,7 @@ class ActiveSession:
     played_seconds: float = 0.0                # 本次会话累计的真实在跑秒数
     last_seen_ts: float = 0.0                  # 最后一次观测到进程存活的时刻
     warned: set = field(default_factory=set)   # 已触发的预警分钟档
+    last_deadline: Optional[float] = None      # 上一轮算出的截止时刻（用于识别 deadline 后移）
 
     @property
     def block_played(self) -> float:
@@ -124,6 +125,8 @@ class Daemon:
         self.conn = db.connect()
         self.games: list[db.Game] = []
         self.daily_limit: Optional[int] = None       # 全局规则 d，随 reload_games 刷新
+        self.daily_minutes: Optional[float] = None   # 全局规则 e 的上限，随 reload_games 刷新
+        self.daily_used: float = 0.0                 # 今天已玩总秒数，每轮 tick 刷新
         self.active: dict[int, ActiveSession] = {}   # game_id -> ActiveSession
         self.captures: dict[int, frames.Capture] = {}  # game_id -> 帧采集子进程
         self.hw: dict[int, hardware.Sampler] = {}      # game_id -> 硬件采样器
@@ -264,7 +267,15 @@ class Daemon:
     def reload_games(self):
         self.games = db.list_games(self.conn, enabled_only=True)
         self.daily_limit = db.get_daily_game_limit(self.conn)
+        self.daily_minutes = db.get_daily_minutes(self.conn)
         self._last_reload = time.time()
+
+    def daily_remaining(self, now: float) -> Optional[float]:
+        """今日总时长还剩多少秒；没设规则 e 返回 None。用每轮 tick 开头刷新的快照，
+        比 DB 落后至多一次心跳（1 秒），对分钟级的额度无影响。"""
+        if not self.daily_minutes:
+            return None
+        return max(0.0, self.daily_minutes * 60 - self.daily_used)
 
     def exe_names(self) -> set[str]:
         return {g.exe_name.lower() for g in self.games}
@@ -316,9 +327,12 @@ class Daemon:
         block = db.current_block(self.conn, g.id)
         resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
 
-        # 全局款数上限先判：它挡的是"今天又开一款新的"，比冷却/时段更能说明问题
+        # 两条全局规则先判：它们挡的是"今天整体玩太多了"，比冷却/时段更能说明问题。
+        # 总时长对续玩同样生效——额度用完了，换回今天玩过的那款接着玩正是要拦的事
         today = db.games_played_between(self.conn, *rules.day_bounds(now))
         verdict = rules.check_daily_limit(self.daily_limit, today, g.id, now)
+        if verdict.allowed:
+            verdict = rules.check_daily_minutes(self.daily_minutes, self.daily_used, now)
         if verdict.allowed:
             verdict = rules.check_start(g, db.last_session_end(self.conn, g.id), now,
                                         resuming=resuming)
@@ -344,7 +358,9 @@ class Daemon:
                              last_seen_ts=now)
         self.active[g.id] = sess
         self._start_capture(g, sess, procs)
-        dl = rules.session_deadline(g, now, carried, quota)
+        dl = rules.session_deadline(g, now, carried, quota,
+                                    daily_remaining=self.daily_remaining(now))
+        sess.last_deadline = dl[0] if dl else None
         head = "接着上一段玩" if resuming else "会话开始"
         log.info(f"{head}：{g.name}" + (f"（本段额度 {quota:g} 分钟）" if quota else "")
                  + (f"，已玩 {carried/60:.1f} 分钟" if carried else "")
@@ -383,11 +399,18 @@ class Daemon:
         sess.last_seen_ts = now
         db.heartbeat(self.conn, sess.session_id, sess.played_seconds, now)
 
-        dl = rules.session_deadline(g, now, sess.block_played, sess.limit_minutes)
+        dl = rules.session_deadline(g, now, sess.block_played, sess.limit_minutes,
+                                    daily_remaining=self.daily_remaining(now))
         if dl is None:
             return
         deadline, reason = dl
         remaining = deadline - now
+
+        # deadline 明显后移（跨零点总额重置、时段规则放宽落地）→ 预警档重新开始计。
+        # 不清的话，重置前擦过的档位会被永久标记，真到点时一声不吭就把游戏杀了
+        if sess.last_deadline is not None and deadline > sess.last_deadline + 60:
+            sess.warned.clear()
+        sess.last_deadline = deadline
 
         if remaining <= 0:
             n = _kill(procs)
@@ -435,6 +458,8 @@ class Daemon:
             self.reload_games()
             self._refresh_active_limits()
             self._ensure_watchdog(now)
+        # 今日已玩总时长每轮重算：跨零点自动归零，多款游戏同时在跑也共用这一份
+        self.daily_used = db.daily_used_seconds(self.conn, now) if self.daily_minutes else 0.0
         procs = _scan_procs(self.exe_names())
         enabled_ids = set()
         for g in self.games:
