@@ -141,3 +141,54 @@ assert "取消「每天游玩总时长」限制" in changes.describe_pending(
     [p for p in changes.global_pendings(conn) if p["field"] == "daily_minutes"][0])
 
 print("test_daily: 全部通过")
+
+
+# ---- 周末档：平日与周末两个数（v0.18.0）----
+FRI, SAT, SUN, MON = (ts(f"2026-08-{d} 21:00") for d in ("14", "15", "16", "17"))
+assert not rules.is_weekend(FRI) and not rules.is_weekend(MON)
+assert rules.is_weekend(SAT) and rules.is_weekend(SUN)
+
+changes.cancel_pending(conn, changes.global_pendings(conn)[0]["id"])   # 清掉上一段留的申请
+db.set_daily_minutes(conn, 60)
+db.set_daily_minutes_weekend(conn, None)
+assert db.effective_daily_minutes(conn, FRI) == 60
+assert db.effective_daily_minutes(conn, SAT) == 60         # 没单独设 = 周末沿用平日
+
+db.set_daily_minutes_weekend(conn, 180)
+assert db.effective_daily_minutes(conn, FRI) == 60         # 平日不受周末档影响
+assert db.effective_daily_minutes(conn, SAT) == 180
+assert db.effective_daily_minutes(conn, SUN) == 180
+assert db.effective_daily_minutes(conn, MON) == 60
+
+# 周末档的空值 = "沿用平日"，不是"不限"：清掉它是从 180 缩到 60 → 收紧，立即生效
+assert changes.request_daily_minutes(conn, None, weekend=True)[0] == "applied"
+assert db.get_daily_minutes_weekend(conn) is None
+# 反过来，平日不限时清掉周末档就成了放宽，得等 24h
+db.set_daily_minutes(conn, None)
+db.set_daily_minutes_weekend(conn, 90)
+status, apply_at, _ = changes.request_daily_minutes(conn, None, weekend=True)
+assert status == "delayed" and db.get_daily_minutes_weekend(conn) == 90
+assert "周末改为沿用平日" in changes.describe_pending(
+    [p for p in changes.global_pendings(conn) if p["field"] == "daily_minutes_weekend"][0])
+assert changes.apply_due(conn, apply_at + 1) == 1
+assert db.get_daily_minutes_weekend(conn) is None
+
+# 周末档自己的收紧/放宽（平日 60 为基准）
+db.set_daily_minutes(conn, 60)
+assert changes.request_daily_minutes(conn, 30, weekend=True)[0] == "applied"   # 比平日还短
+assert db.get_daily_minutes_weekend(conn) == 30
+status, apply_at, msg = changes.request_daily_minutes(conn, 180, weekend=True)
+assert status == "delayed" and db.get_daily_minutes_weekend(conn) == 30, msg
+assert "周末总时长放宽到 180 分钟" in changes.describe_pending(
+    [p for p in changes.global_pendings(conn) if p["field"] == "daily_minutes_weekend"][0])
+assert changes.apply_due(conn, apply_at + 1) == 1
+assert db.get_daily_minutes_weekend(conn) == 180
+
+# 今日剩余额度按今天那一档算（周末 180 / 平日 60，已玩量不变）
+sid = db.open_session(conn, 1, int(SAT - 3600))
+db.heartbeat(conn, sid, 40 * 60, SAT)
+db.close_session(conn, sid, int(SAT), "self_exit")
+assert abs(db.daily_remaining_seconds(conn, SAT) - 140 * 60) < 2     # 180 - 40
+assert abs(db.daily_remaining_seconds(conn, SAT + 3600) - 140 * 60) < 2
+
+print("test_daily: 周末档全部通过")

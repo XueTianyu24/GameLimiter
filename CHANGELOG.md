@@ -2,7 +2,89 @@
 
 > 维护规则：每个节点性 commit 提交前 append 一条，与代码一起 `git add`。时间倒序（最新在上），条目不含自身 hash。
 
+## [v0.18.0] 补三个漏：拆强制层要等 24h / 改名不再脱管 / 周末单独一档 — 2026-08-19
+
+用户问"还有什么真正需要补的"，通读代码找出五个缺口，先做其中三个（另两个是预警加声音、
+未登记游戏发现，留下一版）。三条都不改已有规则语义，只补漏。
+
+### 1. 拆除强制层也走 24 小时冷静期
+
+**纪律不一致**：停用一款游戏、删掉一款游戏、放宽任何一条规则都要等 24 小时，
+唯独 `--remove-system`——一条命令把 SYSTEM 自启 + 每分钟自愈整套卸掉——是**立刻生效**的。
+冲动时最短的那条路反而没设防。
+
+- `--remove-system` 改成**只提交申请**，进的是和放宽规则同一条 `pending_changes` 队列
+  （全局项借 `game_id=0`，field `__remove_system__`）；到期后由守护进程调
+  `setup_system.remove_now()` 落地——守护是 SYSTEM 身份，删得动自己的计划任务
+- **重复申请不重新计时**：等了 20 小时再点一次，剩的还是 4 小时。冷静期要是能被
+  "再点一次"刷新，那它就不是冷静期
+- 落地后守护把 watchdog 和自己一并停掉。否则"拆除"只拆一半——任务没了但进程还在跑，
+  得等重启才真的失效
+- 删不掉（当前身份权限不够）时**申请留着、5 分钟后重试**，不默默作废；也不每 5 秒刷一次日志
+- `apply_due` 加 `on_applied(field, game_id)` 回调：拆完要自杀这件事只有守护自己做得了，
+  而 `changes` 层不该知道守护的存在
+- 诚实边界照旧：自己是管理员，真急着拆就手动
+  `schtasks /Delete /TN GameLimiter-Daemon /F`——这里堵的是"应用自带一条命令就拆干净"
+
+### 2. exe 改个名就脱管 —— 加路径与文件指纹两道识别
+
+原来 `_scan_procs` **只比 exe 文件名**：把游戏复制一份改成 `a.exe` 就完全不在管制内，
+成本 5 秒，比"改规则等 24 小时"低得多。新增 `procmatch.py`，三道识别命中即止：
+
+1. **exe 文件名** —— 老行为，绝大多数情况走这条
+2. **exe 全路径** —— 改了名但还在原地（`games.exe_path` 早就存了，之前从没用于匹配）
+3. **文件指纹** —— 大小 + 首尾各 1 MB 的 sha256，连目录一起复制走再改名也认得出
+
+- 靠**后两条命中时记一条 `renamed` 事件 + 弹窗告知**，规则照旧生效。绕过动作被看见，
+  比悄悄成功更能提高冲动成本
+- **开销实测**：`process_iter(["name","exe"])` 比只取 name 只贵 0.1 ms（400 进程的机器上
+  两者都约 1.5 ms），所以路径匹配每轮全量做、不必缓存 pid。指纹只在"名字和路径都没命中、
+  且大小恰好等于某款受限游戏"时才真读盘，大小/指纹按路径缓存 → 稳态等于不跑
+- **不误伤**：小于 4 MB 的不做指纹识别（小文件撞大小太容易，也不像游戏本体）；
+  系统目录（`%SystemRoot%`）下的进程直接跳过；大小相同但内容不同必须指纹也对得上才算
+- 老数据在守护 `reload_games` 时自动补指纹（`procmatch.backfill`），GUI 添加游戏时当场补
+
+### 3. 规则 e 拆成平日 / 周末两档
+
+一个数必然只能二选一：按平日设，周末太紧；按周末设，平日太松。加
+`daily_minutes_weekend`（周六日），**留空 = 沿用平日**，不是"不限"。
+
+- 因此判收紧/放宽要比**两档实际生效的分钟数**：平日 60 / 周末 180 时清掉周末档，
+  周末反而从 180 缩到 60 —— 那是收紧，该立即生效。直接套"空值=不限"会把它误判成放宽
+- 上限用 `db.effective_daily_minutes(now)` 按当天是周几选，已玩时长的口径完全不变；
+  跨午夜从周五进周六，剩下的时间吃周六的额度（deadline 每轮重算，已有的"deadline
+  后移就清预警档"逻辑正好覆盖）
+- `--cli daily --minutes-weekend N|off`；GUI 全局卡片一行放两个输入框
+
+### 顺带
+
+- 全局规则卡片原来"一款游戏都没有就整块不画"，会让拆除强制层的申请无处可取消 → 改成
+  有全局待生效项时照样画
+- `_safe_console` 从 `cli.py` 搬到 `winutil.py` 改名 `safe_console`，`app.main()` 也调它。
+  `--remove-system` 这类**非 `--cli` 分支同样 print 中文**，而坑 13 的 GBK 崩 + `--windowed`
+  弹窗挂死只在 `--cli` 里防住了。打包版实测：修前输出乱码，修后正常
+
+**改动文件**：新增 `gamelimiter/procmatch.py` + `tests/test_procmatch.py`；
+`db.py`（`games.exe_size/exe_hash` 两列 + 迁移、`set_exe_fingerprint`、
+`daily_minutes_weekend` 设置项 + `effective_daily_minutes`）、`rules.py`（`is_weekend`）、
+`changes.py`（`request_remove_system`、`request_daily_minutes(weekend=)`、
+`apply_due` 特判拆除 + `on_applied` 回调、`GLOBAL_FIELDS` 加周末档）、
+`setup_system.py`（`remove()` → `remove_now()`，明确"不要直接调"）、
+`app.py`（`--remove-system` 转为申请 + 控制台编码兜底）、`winutil.py`（`safe_console`）、`daemon.py`（改用 `procmatch.Matcher`、
+改名告警、今日适用上限、拆除落地后自我收尾）、`cli.py`、`gui.py`
+
+**验证**：单测 13 个全过（新增 `test_procmatch.py` 9 组：三道识别 / 大小相同内容不同不误认 /
+系统目录跳过 / 小文件不走指纹 / 拿不到路径时退回名字 / 指纹补齐幂等；`test_daily.py`
+加周末档 / `test_changes.py` 加拆除队列，含"重复申请不重新计时"与"删不掉就重试"）；
+四个 e2e 全过（`e2e_block` / `e2e_daily` / `e2e_capture` / `e2e_frames`，验证换成
+`procmatch` 后守护的拦截、续玩、总额、采集链路都没走样）；GUI 隔离库无头截图确认
+平日/周末两个输入框与拆除申请那一行
+
 ## [v0.17.0] 新增规则 e：每天游玩总时长 — 2026-08-16
+
+> 已发 Release（08-16，`dist/GameLimiter.exe` 50.8 MB，最小 PATH `--selftest` 过；
+> 公开仓 `main` c50a0eb + tag v0.17.0；已验"冒充 v0.16.0 能查到新版"）。
+> 公开 README 同步加了规则 e 那一行（真相源 `publish/README.md`）。
 
 用户发现的缺口：全局规则只有「每天最多玩几款」（数款数），时长限制全挂在单个游戏上。
 **今天帕鲁 2 小时 + 永劫无间 2 小时 = 4 小时，一条规则都不会响**——限款数根本挡不住

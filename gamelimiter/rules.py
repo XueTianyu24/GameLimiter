@@ -6,7 +6,8 @@
 (b) session_minutes  单次最长时长（上限）：一段游玩累计**真实在跑**多少分钟
 (c) windows          允许时段：仅时段内允许启动；deadline 不晚于当前时段结束
 (d) daily_game_limit **全局**：一天内最多玩几款不同的游戏（不挂在单个游戏上）
-(e) daily_minutes    **全局**：一天内所有游戏加起来最多玩多少分钟（跨游戏总额）
+(e) daily_minutes    **全局**：一天内所有游戏加起来最多玩多少分钟（跨游戏总额）；
+                     周末可另设一档（`daily_minutes_weekend`），未设则全周同一个数
 a/b/c 三条按游戏配置、可叠加；deadline 取最早者。规则收紧立即生效（每轮循环重算 deadline）。
 d/e 两条是全局的：d 管"开几款"，e 管"总共玩多久"——只限款数挡不住每款都玩到天亮。
 
@@ -69,6 +70,14 @@ def next_window_start(windows: list[str], now: datetime) -> Optional[datetime]:
     return min(starts) if starts else None
 
 
+def is_weekend(now_ts: float) -> bool:
+    """今天算不算周末（周六、周日）。规则 e 的周末档按它选。
+
+    按**当前自然日**判，不按会话开始那天——跨午夜从周五进周六，剩下的时间就该吃周六的额度。
+    """
+    return datetime.fromtimestamp(now_ts).weekday() >= 5
+
+
 def day_bounds(now_ts: float) -> tuple[float, float]:
     """now 所在自然日的 [0:00, 次日 0:00)。"""
     d = datetime.fromtimestamp(now_ts).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -98,6 +107,9 @@ def check_daily_minutes(limit_minutes: Optional[float], used_seconds: float,
     `used_seconds` = 今天已经玩掉的**真实在跑**秒数（跨游戏累加，见 `db.daily_used_seconds`）。
     与规则 d 不同，这条对"今天已经玩过的那款"照样生效——总额用完就是用完了，
     换回第一款游戏接着玩正是要拦的事。
+
+    `limit_minutes` 是**今天适用的那一档**（周末与平日可以是两个数），由调用方按
+    `db.effective_daily_minutes` 选好再传进来——本函数不关心今天是周几。
     """
     if not limit_minutes:
         return StartVerdict(True)

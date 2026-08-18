@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS games (
     name TEXT NOT NULL,
     exe_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     exe_path TEXT,
+    exe_size INTEGER,         -- 登记时 exe 的字节数；改名/搬移后靠它做第一道识别（见 procmatch）
+    exe_hash TEXT,            -- exe 首尾各 1MB + 大小的 sha256；size 撞车时的确认位
     cooldown_hours REAL,      -- 规则a 间隔冷却（小时级，同日兜底），NULL=未启用
     next_allowed_date TEXT,   -- 规则a 第二道门：下次可玩日 'YYYY-MM-DD'，过期即失效，NULL=不限
     session_minutes REAL,     -- 规则b 单次最长时长（上限），NULL=未启用
@@ -50,7 +52,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_ts);
 CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,     -- 全局设置（跨游戏）：daily_game_limit / daily_minutes / 采集开关
+    key TEXT PRIMARY KEY,     -- 全局设置（跨游戏）：daily_game_limit / daily_minutes[_weekend] / 采集开关
     value TEXT                -- NULL = 未设/不限
 );
 CREATE TABLE IF NOT EXISTS frame_runs (
@@ -119,6 +121,8 @@ class Game:
     next_session_minutes: Optional[float] = None
     next_allowed_date: Optional[str] = None    # 'YYYY-MM-DD'
     monitor_only: bool = False                 # 只观察不限制
+    exe_size: Optional[int] = None             # exe 指纹：字节数
+    exe_hash: Optional[str] = None             # exe 指纹：首尾 1MB + 大小的 sha256
 
 
 # 老库补列：(表, 列, 类型)。ALTER 幂等靠 duplicate column 异常兜底——守护与 GUI
@@ -130,7 +134,9 @@ _MIGRATIONS = [("games", "icon", "TEXT"),
                ("sessions", "block_id", "INTEGER"),
                ("sessions", "played_seconds", "REAL"),
                ("sessions", "last_seen_ts", "INTEGER"),
-               ("games", "monitor_only", "INTEGER NOT NULL DEFAULT 0")]
+               ("games", "monitor_only", "INTEGER NOT NULL DEFAULT 0"),
+               ("games", "exe_size", "INTEGER"),
+               ("games", "exe_hash", "TEXT")]
 
 
 def _migrate(conn):
@@ -161,6 +167,7 @@ def _row_to_game(r: sqlite3.Row) -> Game:
         next_session_minutes=r["next_session_minutes"],
         next_allowed_date=r["next_allowed_date"],
         monitor_only=bool(r["monitor_only"]),
+        exe_size=r["exe_size"], exe_hash=r["exe_hash"],
     )
 
 
@@ -197,6 +204,15 @@ def upsert_game(conn, name, exe_name, exe_path=None,
 def set_icon(conn, game_id: int, icon: Optional[str]):
     """只改图标，不动 updated_at（补图标不算规则变更）。"""
     conn.execute("UPDATE games SET icon=? WHERE id=?", (icon, game_id))
+    conn.commit()
+
+
+def set_exe_fingerprint(conn, game_id: int, size: Optional[int], digest: Optional[str]):
+    """记下 exe 的大小与指纹，不动 updated_at（补指纹不算规则变更）。
+
+    用途见 `procmatch`：exe 被改名或复制到别处时，靠这两个值仍能认出是同一款游戏。
+    """
+    conn.execute("UPDATE games SET exe_size=?, exe_hash=? WHERE id=?", (size, digest, game_id))
     conn.commit()
 
 
@@ -521,7 +537,8 @@ def capture_jobs(conn, game_id: Optional[int] = None, limit: int = 20) -> list[s
 # ---- 全局设置 ----
 
 DAILY_GAME_LIMIT = "daily_game_limit"
-DAILY_MINUTES = "daily_minutes"        # 规则 e：一天内所有游戏加起来最多玩多少分钟
+DAILY_MINUTES = "daily_minutes"        # 规则 e：一天内所有游戏加起来最多玩多少分钟（平日）
+DAILY_MINUTES_WEEKEND = "daily_minutes_weekend"   # 规则 e 的周末档；未设 = 周末沿用平日值
 CAPTURE_MODE = "capture_mode"          # manual（默认）= 点了才采；auto = 开游戏就采
 CAPTURE_OUT_DIR = "capture_out_dir"    # 上次用的存放目录，作为下次下单的默认值
 
@@ -556,6 +573,30 @@ def get_daily_minutes(conn) -> Optional[float]:
 
 def set_daily_minutes(conn, minutes: Optional[float]):
     set_setting(conn, DAILY_MINUTES, float(minutes) if minutes else None)
+
+
+def get_daily_minutes_weekend(conn) -> Optional[float]:
+    """周末（周六日）的总时长上限；None = 没单独设，周末沿用平日值。"""
+    v = get_setting(conn, DAILY_MINUTES_WEEKEND)
+    return float(v) if v else None
+
+
+def set_daily_minutes_weekend(conn, minutes: Optional[float]):
+    set_setting(conn, DAILY_MINUTES_WEEKEND, float(minutes) if minutes else None)
+
+
+def effective_daily_minutes(conn, now_ts: Optional[float] = None) -> Optional[float]:
+    """今天实际适用的总时长上限：周末有单独设就用周末档，否则用平日值。
+
+    **只影响上限，不影响口径**——已玩时长照旧按自然日累计（`daily_used_seconds`）。
+    跨午夜从周五进周六时上限会变，deadline 每轮重算会跟着变（见 daemon 里 deadline 后移
+    重置预警档的处理）。
+    """
+    from . import rules
+    weekday = get_daily_minutes(conn)
+    if rules.is_weekend(time.time() if now_ts is None else now_ts):
+        return get_daily_minutes_weekend(conn) or weekday
+    return weekday
 
 
 def get_capture_mode(conn) -> str:
@@ -635,7 +676,7 @@ def daily_used_seconds(conn, now_ts: Optional[float] = None) -> float:
 
 def daily_remaining_seconds(conn, now_ts: Optional[float] = None) -> Optional[float]:
     """今天的总时长还剩多少秒；没设规则 e 返回 None（此时**不查库**）。"""
-    limit = get_daily_minutes(conn)
+    limit = effective_daily_minutes(conn, now_ts)
     if not limit:
         return None
     return max(0.0, limit * 60 - daily_used_seconds(conn, now_ts))

@@ -18,8 +18,8 @@ from pathlib import Path
 import psutil
 from nicegui import app, run, ui
 
-from . import (changes, config, db, frames, icons, rules, setup_system, stats,
-               steam, updater)
+from . import (changes, config, db, frames, icons, procmatch, rules, setup_system,
+               stats, steam, updater)
 from .version import __version__
 from .winutil import (DAEMON_MUTEX, is_frozen, mutex_exists, run_elevated,
                       spawn_detached)
@@ -56,7 +56,8 @@ def game_state(g: db.Game) -> tuple[str, str, str, bool]:
     # 上一段还没玩完 → 现在再打开是"接着玩"，用剩下的额度，不查冷却
     resuming = rules.block_alive(block, g.session_minutes, now, config.IDLE_GRACE_MINUTES)
     # 全局总时长用完时每张卡片都该照实说，而不是各自显示"现在可玩"
-    daily_cap, daily_used = db.get_daily_minutes(conn), db.daily_used_seconds(conn, now)
+    daily_cap = db.effective_daily_minutes(conn, now)      # 今天适用的那一档（平日/周末）
+    daily_used = db.daily_used_seconds(conn, now)
     daily = rules.check_daily_minutes(daily_cap, daily_used, now)
     v = (rules.check_start(g, db.last_session_end(conn, g.id), now, resuming=resuming)
          if daily.allowed else daily)
@@ -521,12 +522,20 @@ def backfill_icons(games: list[db.Game]) -> bool:
 
 @ui.refreshable
 def global_rule_view():
-    """全局规则 d（每天最多玩几款）+ e（每天游玩总时长），不挂在单个游戏卡片上。"""
-    if not db.list_games(conn):
+    """全局规则 d（每天最多玩几款）+ e（每天游玩总时长），不挂在单个游戏卡片上。
+
+    没有任何游戏时通常整块不画；但只要有待生效的全局申请（如拆除强制层）就得画出来，
+    否则那条申请没有地方能取消。
+    """
+    pendings = changes.global_pendings(conn)
+    if not db.list_games(conn) and not pendings:
         return
     now = time.time()
     limit = db.get_daily_game_limit(conn)
     minutes = db.get_daily_minutes(conn)
+    weekend = db.get_daily_minutes_weekend(conn)
+    is_weekend = rules.is_weekend(now)
+    eff = (weekend or minutes) if is_weekend else minutes
     used = db.daily_used_seconds(conn, now) / 60
     today = db.games_played_between(conn, *rules.day_bounds(now))
     with ui.card().classes("w-full rounded-2xl shadow-sm p-3 gap-1 bg-white"):
@@ -561,33 +570,50 @@ def global_rule_view():
         with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
             ui.icon("hourglass_bottom").classes("text-xl text-sky-500")
             ui.label("每天总共玩").classes("text-sm text-slate-600 shrink-0")
+            ui.label("平日").classes("text-xs text-slate-400 shrink-0")
             m = ui.number(value=minutes, min=0, step=10, placeholder="不限") \
                 .classes("w-[84px]").props("dense") \
-                .tooltip("所有游戏加起来一天最多玩多少分钟；空 = 不限。"
+                .tooltip("周一至周五，所有游戏加起来一天最多玩多少分钟；空 = 不限。"
                          "用完后正在玩的那局也会走预警倒计时后关闭。调小立即生效，调大延迟 24 小时")
+            ui.label("分钟 · 周末").classes("text-xs text-slate-400 shrink-0")
+            w = ui.number(value=weekend, min=0, step=10, placeholder="同平日") \
+                .classes("w-[84px]").props("dense") \
+                .tooltip("周六日单独一档；空 = 沿用平日的数。"
+                         "改动同样是调小立即生效、调大延迟 24 小时")
             ui.label("分钟").classes("text-sm text-slate-600 shrink-0")
-            if minutes:
-                left = max(0.0, minutes - used)
-                ui.label(f"· 今天已玩 {used:.0f} 分钟，还剩 {left:.0f} 分钟"
+            today_zh = "今天是周末" if is_weekend else "今天是平日"
+            if eff:
+                left = max(0.0, eff - used)
+                ui.label(f"· {today_zh}（上限 {eff:g} 分钟），已玩 {used:.0f} 分钟，"
+                         f"还剩 {left:.0f} 分钟"
                          + ("（已用满，今天都打不开了）" if left <= 0 else "")) \
                     .classes("text-xs " + ("text-amber-600" if left <= 0 else "text-slate-400"))
             else:
-                ui.label(f"· 今天已玩 {used:.0f} 分钟").classes("text-xs text-slate-400")
+                ui.label(f"· {today_zh}，今天已玩 {used:.0f} 分钟") \
+                    .classes("text-xs text-slate-400")
             ui.space()
             ui.button("不限", on_click=lambda: (m.set_value(None), save_minutes())) \
                 .props("flat dense size=sm color=grey")
 
-        def save_minutes(m=m):
-            status, _, msg = changes.request_daily_minutes(conn, m.value)
+        def _save_minutes(box, for_weekend: bool):
+            status, _, msg = changes.request_daily_minutes(conn, box.value, for_weekend)
             if status == "nochange":
                 return
             ui.notify(msg, type="positive" if status == "applied" else "warning")
             global_rule_view.refresh()
             games_view.refresh()
+
+        def save_minutes(m=m):
+            _save_minutes(m, False)
+
+        def save_weekend(w=w):
+            _save_minutes(w, True)
         m.on("blur", save_minutes)
         m.on("keydown.enter", save_minutes)
+        w.on("blur", save_weekend)
+        w.on("keydown.enter", save_weekend)
 
-        for p in changes.global_pendings(conn):
+        for p in pendings:
             with ui.row().classes("w-full items-center gap-1"):
                 ui.icon("hourglass_top").classes("text-amber-500 text-sm")
                 ui.label(changes.describe_pending(p)).classes("text-xs text-amber-600 flex-grow")
@@ -623,8 +649,10 @@ def add_game(name: str, exe_name: str, exe_path: str = None):
     if not exe_name.lower().endswith(".exe"):
         ui.notify("进程名需以 .exe 结尾", type="warning")
         return False
-    db.upsert_game(conn, name, exe_name, exe_path=exe_path,
-                   icon=icons.extract_icon(exe_path))
+    g = db.upsert_game(conn, name, exe_name, exe_path=exe_path,
+                       icon=icons.extract_icon(exe_path))
+    # 记下 exe 指纹：以后文件被改名或复制到别处，仍认得出是这款游戏（见 procmatch）
+    procmatch.backfill(conn, [g], db.set_exe_fingerprint)
     ui.notify(f"已添加 {name}，在卡片上配置规则", type="positive")
     games_view.refresh()
     global_rule_view.refresh()      # 第一款游戏加进来时这条全局规则才出现

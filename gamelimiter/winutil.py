@@ -1,4 +1,4 @@
-"""Windows 工具：互斥体、自我重启命令、分离进程。"""
+"""Windows 工具：互斥体、自我重启命令、分离进程、控制台编码兜底。"""
 
 import ctypes
 import subprocess
@@ -71,3 +71,23 @@ def run_elevated(*args, file: str | None = None) -> bool:
         cwd = str(project_root())
     r = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, cwd, 1)
     return r > 32
+
+
+def safe_console():
+    """让输出编码不成为故障源。两种情形分开处理：
+
+    1. **接真控制台**：跟随控制台编码（中文机器多为 GBK），只把编码不了的字符降级成
+       '?'。打包 exe 输出一个 GBK 没有的字符（如 ✓）会抛 UnicodeEncodeError 让命令
+       直接失败，更糟的是 --windowed 下还会弹对话框把进程挂住。
+    2. **被重定向到文件/管道**：强制 UTF-8。`--windowed` 打包的 exe 在 ssh 下必须把
+       stdout 重定向到文件才拿得到输出（USAGE 坑 10），而那时 Python 挑的编码可能是
+       ASCII，中文全变成 '?'——远程看自己的游玩报告全是问号，等于没有。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass

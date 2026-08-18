@@ -12,21 +12,29 @@ from . import config, db, rules
 FIELD_ZH = {"cooldown_hours": "间隔冷却", "session_minutes": "单次最长时长",
             "windows": "允许时段", "enabled": "启用状态", "__delete__": "删除游戏",
             "daily_game_limit": "每天最多玩几款", "next_allowed_date": "下次可玩日",
-            "monitor_only": "观察模式", "daily_minutes": "每天游玩总时长"}
+            "monitor_only": "观察模式", "daily_minutes": "每天游玩总时长（平日）",
+            "daily_minutes_weekend": "每天游玩总时长（周末）",
+            "__remove_system__": "拆除强制层"}
 
 # 全局设置在 pending_changes 里借 game_id=0 落座（games.id 从 1 起，不会撞）
 GLOBAL_GAME_ID = 0
 
+# 拆除强制层：同样是"放宽"，走同一条 24h 队列（见 request_remove_system）
+REMOVE_SYSTEM = "__remove_system__"
+
 # 全局设置的读写函数表：待生效队列落地时按 field 派发（游戏级的走 db.update_rules）
 GLOBAL_FIELDS = {"daily_game_limit": (db.get_daily_game_limit, db.set_daily_game_limit),
-                 "daily_minutes": (db.get_daily_minutes, db.set_daily_minutes)}
+                 "daily_minutes": (db.get_daily_minutes, db.set_daily_minutes),
+                 "daily_minutes_weekend": (db.get_daily_minutes_weekend,
+                                           db.set_daily_minutes_weekend)}
 
 
 def is_tightening(field: str, old, new) -> bool:
     """new 相对 old 是否为收紧（含不变）。收紧立即生效，放宽入待生效队列。"""
     if field == "cooldown_hours":
         return (new or 0) >= (old or 0)                    # 冷却更长 = 更严
-    if field in ("session_minutes", "daily_game_limit", "daily_minutes"):
+    if field in ("session_minutes", "daily_game_limit", "daily_minutes",
+                 "daily_minutes_weekend"):
         inf = float("inf")
         return (new or inf) <= (old or inf)                # 更短/更少 = 更严；None = 不限
     if field == "next_allowed_date":
@@ -83,29 +91,75 @@ def request_delete(conn, g: db.Game) -> Optional[int]:
 
 # ---- 全局规则 e：每天游玩总时长 ----
 
-def request_daily_minutes(conn, new) -> tuple[str, Optional[int], str]:
-    """申请改「每天游玩总时长」。返回 (状态, apply_at, 中文说明)，纪律同规则 d。
+def request_daily_minutes(conn, new, weekend: bool = False) -> tuple[str, Optional[int], str]:
+    """申请改「每天游玩总时长」。`weekend=True` 改的是周末那一档。返回 (状态, apply_at, 说明)。
 
     注意收紧是**立即**生效的：把上限调到比今天已玩的还小，今天剩下的时间就直接封死了。
     这是有意为之——收紧永远即时，是防冲动的地基。
+
+    **周末档的空值不是"不限"，是"沿用平日"**——所以判收紧/放宽要比的是两档**实际生效**
+    的分钟数：平日 60 / 周末 180 时清掉周末档，周末反而从 180 缩到 60，那是收紧，该立即生效。
     """
-    old = db.get_daily_minutes(conn)
+    field = db.DAILY_MINUTES_WEEKEND if weekend else db.DAILY_MINUTES
+    old = db.get_daily_minutes_weekend(conn) if weekend else db.get_daily_minutes(conn)
     new = float(new) if new else None
     if new is not None and new <= 0:
         new = None
     if new == old:
         return "nochange", None, ""
-    if is_tightening("daily_minutes", old, new):
-        db.set_daily_minutes(conn, new)
-        db.clear_pending_field(conn, GLOBAL_GAME_ID, "daily_minutes")
-        return "applied", None, (f"已生效：每天所有游戏加起来最多玩 {new:g} 分钟" if new
+    if weekend:
+        base = db.get_daily_minutes(conn)
+        tighten = is_tightening("daily_minutes", old or base, new or base)
+    else:
+        tighten = is_tightening("daily_minutes", old, new)
+    when = "周末" if weekend else "平日"
+    if tighten:
+        (db.set_daily_minutes_weekend if weekend else db.set_daily_minutes)(conn, new)
+        db.clear_pending_field(conn, GLOBAL_GAME_ID, field)
+        if new:
+            return "applied", None, f"已生效：{when}所有游戏加起来最多玩 {new:g} 分钟"
+        return "applied", None, ("已取消周末单独的额度，周末沿用平日的数" if weekend
                                  else "已取消每天总时长限制")
     apply_at = int(time.time() + config.RELAX_DELAY_HOURS * 3600)
-    db.upsert_pending(conn, GLOBAL_GAME_ID, "daily_minutes", new, apply_at)
+    db.upsert_pending(conn, GLOBAL_GAME_ID, field, new, apply_at)
     from datetime import datetime
     t = datetime.fromtimestamp(apply_at).strftime("%m-%d %H:%M")
-    desc = f"放宽到每天 {new:g} 分钟" if new else "取消总时长限制"
+    if new:
+        desc = f"{when}放宽到每天 {new:g} 分钟"
+    else:
+        desc = "周末改为沿用平日的数" if weekend else "取消总时长限制"
     return "delayed", apply_at, f"{desc}属于放宽，要等到 {t} 才生效（期间可随时取消）"
+
+
+# ---- 拆除强制层：也是放宽，也走 24h ----
+
+def request_remove_system(conn) -> tuple[str, Optional[int], str]:
+    """申请拆除强制层（SYSTEM 自启 + 每分钟自愈）。
+
+    停用一款游戏、删除一款游戏、放宽任何一条规则都要等 24 小时，**唯独"把整套强制层
+    一键卸掉"以前是立刻生效的**——冲动上来最短的那条路反而没设防。改成同一条队列：
+    申请 → 24 小时后由守护进程（SYSTEM 身份，有权限删任务）落地 → 守护与 watchdog 一并退出。
+    期间随时可以 `--cli pending --cancel <id>` 撤销。
+
+    **重复申请不会重新计时**：等了 20 小时再点一次，剩的还是 4 小时，不是又一个 24 小时。
+    诚实边界照旧：自己是管理员，真急着拆就手动
+    `schtasks /Delete /TN GameLimiter-Daemon /F`——这里堵的是"应用自带一条命令就拆干净"。
+    """
+    from . import setup_system
+    if not setup_system.is_configured():
+        return "nochange", None, "强制层没有配置，无需拆除"
+    from datetime import datetime
+    for p in db.list_pending(conn, GLOBAL_GAME_ID):
+        if p["field"] == REMOVE_SYSTEM:
+            t = datetime.fromtimestamp(p["apply_at"]).strftime("%m-%d %H:%M")
+            left = max(0.0, (p["apply_at"] - time.time()) / 3600)
+            return "pending", p["apply_at"], (f"已经申请过了：{t} 生效（还有 {left:.1f} 小时），"
+                                              f"再点一次不会提前，也不会重新计时")
+    apply_at = int(time.time() + config.RELAX_DELAY_HOURS * 3600)
+    db.upsert_pending(conn, GLOBAL_GAME_ID, REMOVE_SYSTEM, None, apply_at)
+    t = datetime.fromtimestamp(apply_at).strftime("%m-%d %H:%M")
+    return "delayed", apply_at, (f"拆除强制层属于放宽，{t} 才会真的拆（期间可随时取消）；"
+                                 f"在那之前守护与自愈任务照常运行")
 
 
 # ---- 全局规则 d：每天最多玩几款游戏 ----
@@ -192,11 +246,22 @@ def cancel_pending(conn, pending_id: int):
     db.delete_pending(conn, pending_id)
 
 
-def apply_due(conn, now: float) -> int:
-    """把到期的待生效变更落地（守护进程周期调用）。返回应用条数。"""
+def apply_due(conn, now: float, on_applied=None) -> int:
+    """把到期的待生效变更落地（守护进程周期调用）。返回应用条数。
+
+    `on_applied(field, game_id)` 每落地一条回调一次——拆除强制层那条需要守护进程
+    在落地后把自己和 watchdog 一并停掉，这事只有守护自己做得了。
+    """
     n = 0
     for p in db.due_pendings(conn, now):
-        if p["game_id"] == GLOBAL_GAME_ID:
+        if p["field"] == REMOVE_SYSTEM:
+            from .setup_system import remove_now
+            if not remove_now():
+                # 删不掉（多半是当前身份权限不够）→ 推后 5 分钟重试，别每 5 秒刷一次日志
+                db.upsert_pending(conn, GLOBAL_GAME_ID, REMOVE_SYSTEM, None, int(now + 300))
+                continue
+            db.delete_pending(conn, p["id"])
+        elif p["game_id"] == GLOBAL_GAME_ID:
             GLOBAL_FIELDS[p["field"]][1](conn, json.loads(p["value"])["v"])
             db.delete_pending(conn, p["id"])
         elif p["field"] == "__delete__":
@@ -206,6 +271,8 @@ def apply_due(conn, now: float) -> int:
             db.update_rules(conn, p["game_id"], **{p["field"]: v})
             db.delete_pending(conn, p["id"])
         n += 1
+        if on_applied:
+            on_applied(p["field"], p["game_id"])
     return n
 
 
@@ -213,12 +280,17 @@ def describe_pending(p) -> str:
     """给 UI/CLI 的一行中文描述。"""
     from datetime import datetime
     t = datetime.fromtimestamp(p["apply_at"]).strftime("%m-%d %H:%M")
+    if p["field"] == REMOVE_SYSTEM:
+        return f"拆除强制层（SYSTEM 自启 + 每分钟自愈），{t} 生效"
     if p["field"] == "__delete__":
         return f"解除全部限制并删除，{t} 生效"
     v = json.loads(p["value"])["v"]
     if p["game_id"] == GLOBAL_GAME_ID:
+        if p["field"] == "daily_minutes_weekend":
+            return (f"周末总时长放宽到 {v:g} 分钟，{t} 生效" if v
+                    else f"周末改为沿用平日的总时长，{t} 生效")
         if p["field"] == "daily_minutes":
-            return (f"每天游玩总时长放宽到 {v:g} 分钟，{t} 生效" if v
+            return (f"平日总时长放宽到 {v:g} 分钟，{t} 生效" if v
                     else f"取消「每天游玩总时长」限制，{t} 生效")
         return (f"每天最多玩 {v} 款游戏，{t} 生效" if v
                 else f"取消「每天最多玩几款」限制，{t} 生效")

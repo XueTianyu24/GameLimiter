@@ -18,7 +18,7 @@ from typing import Optional
 
 import psutil
 
-from . import changes, config, db, frames, hardware, rules
+from . import changes, config, db, frames, hardware, procmatch, rules
 from .config import LOG_PATH, POLL_INTERVAL, RULE_RELOAD_INTERVAL, WARN_MINUTES
 from .notifier import popup
 from .winutil import DAEMON_MUTEX, WATCHDOG_MUTEX, hold_mutex, mutex_exists, spawn_detached
@@ -76,19 +76,6 @@ def _fmt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
-def _scan_procs(exe_names: set[str]) -> dict[str, list[psutil.Process]]:
-    """一次遍历，返回 {exe_name_lower: [Process,...]}（仅受限名单内的）。"""
-    found: dict[str, list[psutil.Process]] = {}
-    for p in psutil.process_iter(["name"]):
-        try:
-            n = (p.info["name"] or "").lower()
-        except psutil.Error:
-            continue
-        if n in exe_names:
-            found.setdefault(n, []).append(p)
-    return found
-
-
 def _kill(procs: list[psutil.Process]) -> int:
     n = 0
     for p in procs:
@@ -131,6 +118,8 @@ class Daemon:
         self.captures: dict[int, frames.Capture] = {}  # game_id -> 帧采集子进程
         self.hw: dict[int, hardware.Sampler] = {}      # game_id -> 硬件采样器
         self.jobs: dict[int, dict] = {}   # game_id -> {job_id, deadline}（手动采集任务）
+        self.matcher = procmatch.Matcher()   # 名字/路径/指纹三道识别，缓存跨轮复用
+        self.aliased: dict[int, str] = {}     # game_id -> 已告警过的改名，避免同一次反复弹
         self.wake = threading.Event()
         self._last_reload = 0.0
         self._last_wd_spawn = 0.0
@@ -234,7 +223,7 @@ class Daemon:
             except Exception:
                 log.exception("帧采集收尾异常（不影响限制）")
 
-    def _tick_capture_jobs(self, now: float, procs: dict):
+    def _tick_capture_jobs(self, now: float, matches: dict):
         """采集任务的状态机。三件事：到点/被取消的停掉、待命超时的作废、
         游戏已经在跑时才下的单立刻挂上。"""
         for gid, info in list(self.jobs.items()):
@@ -260,14 +249,22 @@ class Daemon:
                                        "deadline": now + dur * 60 if dur else None}
                     log.info("采集任务 %d 接管进行中的采集：%s", job["id"], g.name)
                 else:
-                    self._begin_capture(g, sess, procs.get(g.exe_name.lower()), job)
+                    m = matches.get(g.id)
+                    self._begin_capture(g, sess, m.procs if m else None, job)
 
     # ---- 规则/名单 ----
 
     def reload_games(self):
         self.games = db.list_games(self.conn, enabled_only=True)
         self.daily_limit = db.get_daily_game_limit(self.conn)
-        self.daily_minutes = db.get_daily_minutes(self.conn)
+        # 今天适用的那一档（周末可能与平日不同）；每 5 秒重载一次，跨零点自动切档
+        self.daily_minutes = db.effective_daily_minutes(self.conn)
+        try:
+            n = procmatch.backfill(self.conn, self.games, db.set_exe_fingerprint)
+            if n:
+                log.info("补齐 %d 款游戏的 exe 指纹（改名/搬移后仍可识别）", n)
+        except Exception:
+            log.exception("补 exe 指纹异常（不影响限制）")
         self._last_reload = time.time()
 
     def daily_remaining(self, now: float) -> Optional[float]:
@@ -290,10 +287,11 @@ class Daemon:
         """
         now = time.time()
         all_games = {g.id: g for g in db.list_games(self.conn)}
-        procs = _scan_procs({g.exe_name.lower() for g in all_games.values()})
+        matches = self.matcher.scan(all_games.values())
         for row in db.open_sessions(self.conn):
             g = all_games.get(row["game_id"])
-            alive = g and procs.get(g.exe_name.lower())
+            m = matches.get(g.id) if g else None
+            alive = m.procs if m else None
             if alive:
                 siblings = [r for r in db.block_rows(self.conn, db.block_of(row))
                             if r["id"] != row["id"]]
@@ -312,7 +310,26 @@ class Daemon:
 
     # ---- 每轮处理 ----
 
-    def _handle_start_attempt(self, g: db.Game, procs: list[psutil.Process], now: float):
+    def _alias_alert(self, g: db.Game, m: procmatch.Match):
+        """exe 被改名 / 复制到别处运行 → 记一笔并告知。规则照旧生效，不因改名放行。
+
+        只在这一次识别结果变化时报，避免同一个副本每次开都弹。
+        """
+        if m.kind == "name" or not m.alias:
+            self.aliased.pop(g.id, None)
+            return
+        if self.aliased.get(g.id) == m.alias:
+            return
+        self.aliased[g.id] = m.alias
+        how = "改名后" if m.kind == "path" else "复制到别处并改名后"
+        db.log_event(self.conn, g.id, "renamed", f"{m.kind}: {m.alias}")
+        log.warning("%s 被%s运行：%s —— 仍按原规则处理", g.name, how, m.alias)
+        popup(f"GameLimiter — 认出了改名的 {g.name}",
+              f"检测到 {g.name} 被{how}运行（{m.alias}），规则照常生效。", warn=True)
+
+    def _handle_start_attempt(self, g: db.Game, m: procmatch.Match, now: float):
+        procs = m.procs
+        self._alias_alert(g, m)
         # 观察模式：只开会话挂采集，一条规则都不查（PVP 游戏被强杀会判逃跑，
         # 这条路径上必须连"算一下会不会被拦"都不做）
         if rules.is_observed(g):
@@ -441,6 +458,21 @@ class Daemon:
                 log.info(f"会话额度更新：session {sess.session_id} → {row['limit_minutes']} 分钟")
                 sess.limit_minutes = row["limit_minutes"]
 
+    def _on_change_applied(self, field: str, game_id: int):
+        """待生效变更落地时的回调。拆强制层那条要守护自己收尾——计划任务已经删了，
+        但守护和 watchdog 还在跑，不停掉的话"拆除"只拆了一半（重启才失效）。
+        """
+        if field != changes.REMOVE_SYSTEM:
+            return
+        log.warning("拆除强制层的 24 小时冷静期到期：计划任务已删除，守护与 watchdog 一并退出")
+        db.log_event(self.conn, None, "system_removed", "冷静期到期，强制层已拆除")
+        popup("GameLimiter — 强制层已拆除",
+              "SYSTEM 自启与每分钟自愈任务已删除，守护进程即将退出。"
+              "想重新启用：打开面板点「初始化本机」。")
+        from .app import _stop_daemon
+        _stop_daemon()          # 先杀 watchdog，否则自己一退它 5 秒内就把守护拉回来
+        raise SystemExit(0)
+
     def _ensure_watchdog(self, now: float):
         if os.environ.get("GAMELIMITER_NO_WATCHDOG") == "1":
             return
@@ -452,7 +484,7 @@ class Daemon:
     def tick(self):
         now = time.time()
         if now - self._last_reload > RULE_RELOAD_INTERVAL:
-            n = changes.apply_due(self.conn, now)
+            n = changes.apply_due(self.conn, now, on_applied=self._on_change_applied)
             if n:
                 log.info(f"应用 {n} 条到期的放宽变更")
             self.reload_games()
@@ -460,14 +492,15 @@ class Daemon:
             self._ensure_watchdog(now)
         # 今日已玩总时长每轮重算：跨零点自动归零，多款游戏同时在跑也共用这一份
         self.daily_used = db.daily_used_seconds(self.conn, now) if self.daily_minutes else 0.0
-        procs = _scan_procs(self.exe_names())
+        matches = self.matcher.scan(self.games)
         enabled_ids = set()
         for g in self.games:
             enabled_ids.add(g.id)
-            plist = [p for p in procs.get(g.exe_name.lower(), []) if p.is_running()]
+            m = matches.get(g.id)
+            plist = [p for p in (m.procs if m else []) if p.is_running()]
             sess = self.active.get(g.id)
             if sess is None and plist:
-                self._handle_start_attempt(g, plist, now)
+                self._handle_start_attempt(g, procmatch.Match(plist, m.kind, m.alias), now)
             elif sess is not None:
                 self._handle_running(g, sess, plist, now)
         # 游戏被禁用/删除但会话还挂着 → 关闭会话，停止跟踪
@@ -477,7 +510,7 @@ class Daemon:
             self._stop_capture(gid, "游戏已停用")
         self._reap_dead_frame_captures()
         try:
-            self._tick_capture_jobs(now, procs)
+            self._tick_capture_jobs(now, matches)
         except Exception:
             log.exception("采集任务处理异常（不影响限制）")
         self._sweep(now)

@@ -5,7 +5,7 @@
   --watchdog        watchdog（守护进程自动拉起）
   --tray            托盘图标（用户身份，GUI 自动拉起并登记开机自启）
   --setup-system    配置强制层（SYSTEM 计划任务，需管理员）
-  --remove-system   移除强制层（需管理员）
+  --remove-system   申请拆除强制层（放宽，24 小时后才真的拆；期间可 --cli pending --cancel）
   --stop-daemon     停止 watchdog + 守护（调试用；SYSTEM 化后需管理员才杀得动）
   --cli ...         命令行管理透传，如 GameLimiter.exe --cli list
   --selftest        自检：加载所有关键原生依赖后退出（打包后验证自包含用）
@@ -26,7 +26,8 @@ def _selftest():
     import psutil  # noqa: F401
     from nicegui import ui  # noqa: F401  拉起 nicegui.native → ctypes 全链
     from . import (changes, cli, daemon, db, frames, gui, hardware, icons,  # noqa: F401
-                   rules, setup_system, stats, steam, tray, updater, version, watchdog)
+                   procmatch, rules, setup_system, stats, steam, tray, updater,
+                   version, watchdog)
     print("selftest OK")
     print("presentmon: " + str(frames.presentmon_path() or "MISSING"))
 
@@ -59,6 +60,11 @@ def _stop_daemon():
 
 def main():
     args = sys.argv[1:]
+    # 这里几个分支（--remove-system / --setup-system / --version / --selftest）也 print 中文。
+    # 打包 exe 的 stdout 默认走系统 ANSI 代码页，编不了的字符会抛异常，而 --windowed 下
+    # 未捕获异常会弹对话框把进程挂住（USAGE 坑 13）。跟 --cli 用同一套兜底。
+    from .winutil import safe_console
+    safe_console()
     if "--daemon" in args:
         from .daemon import main as m
         m()
@@ -72,8 +78,10 @@ def main():
         from .setup_system import setup
         sys.exit(0 if setup() else 1)
     elif "--remove-system" in args:
-        from .setup_system import remove
-        sys.exit(0 if remove() else 1)
+        # 只提交申请，24h 后由守护进程落地。三种结果（新申请 / 已申请过 / 本来就没配置）
+        # 都不是失败——"强制层最终会没有"这件事都成立，所以一律 0
+        from . import changes, db
+        print(changes.request_remove_system(db.connect())[2])
     elif "--selftest" in args:
         _selftest()
     elif "--apply-update" in args:

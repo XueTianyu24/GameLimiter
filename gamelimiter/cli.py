@@ -15,7 +15,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from . import changes, config, db, frames, hardware, rules
-from .winutil import DAEMON_MUTEX, mutex_exists
+from .winutil import DAEMON_MUTEX, mutex_exists, safe_console
 
 
 def _num_or_off(s):
@@ -36,6 +36,10 @@ def _date_or_off(s):
 
 def _fmt_ts(ts):
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S") if ts else "-"
+
+
+def _fmt_minutes(m):
+    return f"{m:g} 分钟" if m else "不限"
 
 
 def cmd_add(conn, a):
@@ -64,11 +68,11 @@ def cmd_list(conn, a):
     games = db.list_games(conn)
     now = time.time()
     limit = db.get_daily_game_limit(conn)
-    minutes = db.get_daily_minutes(conn)
+    eff = db.effective_daily_minutes(conn, now)
     today = db.games_played_between(conn, *rules.day_bounds(now))
     used = db.daily_used_seconds(conn, now) / 60
     print(f"全局：每天最多玩 {f'{limit} 款' if limit else '不限'}"
-          f"、总时长 {f'{minutes:g} 分钟' if minutes else '不限'}；"
+          f"、今天（{'周末' if rules.is_weekend(now) else '平日'}）总时长 {_fmt_minutes(eff)}；"
           f"今天已玩 {len(today)} 款 / {used:.0f} 分钟")
     if not games:
         print("（无受限游戏）")
@@ -158,22 +162,29 @@ def cmd_next(conn, a):
 def cmd_daily(conn, a):
     """全局每日规则：最多几款（位置参数）+ 总时长上限（--minutes）。不给值=查看。"""
     now = time.time()
-    if a.minutes is not None:
-        print(changes.request_daily_minutes(conn, _num_or_off(a.minutes))[2] or "无变化")
+    changed = False
+    for value, weekend in ((a.minutes, False), (a.minutes_weekend, True)):
+        if value is not None:
+            changed = True
+            print(changes.request_daily_minutes(conn, _num_or_off(value), weekend)[2] or "无变化")
     if a.count is not None:
+        changed = True
         print(changes.request_daily_limit(conn, _num_or_off(a.count))[2] or "无变化")
-    if a.count is not None or a.minutes is not None:
+    if changed:
         return
 
     today = db.games_played_between(conn, *rules.day_bounds(now))
     limit = db.get_daily_game_limit(conn)
     print(f"每天最多玩：{f'{limit} 款' if limit else '不限'}；"
           f"今天已玩 {len(today)} 款" + (f"（{'、'.join(today.values())}）" if today else ""))
-    minutes = db.get_daily_minutes(conn)
+    weekend = db.get_daily_minutes_weekend(conn)
+    eff = db.effective_daily_minutes(conn, now)
     used = db.daily_used_seconds(conn, now) / 60
-    print(f"每天总时长：{f'{minutes:g} 分钟' if minutes else '不限'}；"
-          f"今天已玩 {used:.0f} 分钟"
-          + (f"，还剩 {max(0.0, minutes - used):.0f} 分钟" if minutes else ""))
+    print(f"每天总时长：平日 {_fmt_minutes(db.get_daily_minutes(conn))} / "
+          f"周末 {_fmt_minutes(weekend) if weekend else '同平日'}；"
+          f"今天是{'周末' if rules.is_weekend(now) else '平日'}，"
+          f"适用 {_fmt_minutes(eff)}，已玩 {used:.0f} 分钟"
+          + (f"，还剩 {max(0.0, eff - used):.0f} 分钟" if eff else ""))
     for p in changes.global_pendings(conn):
         print(f"  [{p['id']}] 待生效：{changes.describe_pending(p)}")
 
@@ -383,28 +394,8 @@ def cmd_history(conn, a):
         print(f"{_fmt_ts(r['ts'])}  {r['type']}  {r['detail'] or ''}")
 
 
-def _safe_console():
-    """让输出编码不成为故障源。两种情形分开处理：
-
-    1. **接真控制台**：跟随控制台编码（中文机器多为 GBK），只把编码不了的字符降级成
-       '?'。打包 exe 输出一个 GBK 没有的字符（如 ✓）会抛 UnicodeEncodeError 让命令
-       直接失败，更糟的是 --windowed 下还会弹对话框把进程挂住。
-    2. **被重定向到文件/管道**：强制 UTF-8。`--windowed` 打包的 exe 在 ssh 下必须把
-       stdout 重定向到文件才拿得到输出（USAGE 坑 10），而那时 Python 挑的编码可能是
-       ASCII，中文全变成 '?'——远程看自己的游玩报告全是问号，等于没有。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            if stream.isatty():
-                stream.reconfigure(errors="replace")
-            else:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, OSError, ValueError):
-            pass
-
-
 def main():
-    _safe_console()
+    safe_console()
     ap = argparse.ArgumentParser(prog="gamelimiter.cli")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -442,7 +433,9 @@ def main():
     p = sub.add_parser("daily", help="全局每日规则：最多几款 + 总时长（调小即时，调大延迟 24h）")
     p.add_argument("count", nargs="?", default=None, help="款数或 off；留空=查看")
     p.add_argument("--minutes", default=None,
-                   help="每天所有游戏加起来最多玩多少分钟，或 off")
+                   help="平日（周一至周五）所有游戏加起来最多玩多少分钟，或 off")
+    p.add_argument("--minutes-weekend", default=None,
+                   help="周末（周六日）单独的分钟数；off = 周末沿用平日的数")
     p.set_defaults(fn=cmd_daily)
 
     p = sub.add_parser("remove", help="删除游戏")

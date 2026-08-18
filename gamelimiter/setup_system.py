@@ -4,7 +4,9 @@
 - 每分钟自愈任务重复拉起守护（单实例互斥体保证不重复跑），杀掉也 1 分钟内复活
 - GUI「初始化本机」按钮经 UAC 调用 --setup-system 到这里
 
-用法（管理员）：GameLimiter.exe --setup-system / --remove-system
+用法（管理员）：GameLimiter.exe --setup-system
+拆除走 `--remove-system`，但**只是提交申请**：与停用游戏/放宽规则同一条 24 小时队列，
+到期后由守护进程调本模块的 `remove_now()` 落地（见 changes.request_remove_system）。
 """
 
 import os
@@ -100,7 +102,10 @@ def setup() -> bool:
     return True
 
 
-def remove() -> bool:
+def remove_now() -> bool:
+    """真的删掉两个计划任务。**不要直接调**——拆强制层要走 24h 冷静期，
+    入口是 `changes.request_remove_system`，到期后由守护进程（SYSTEM 身份）调到这里。
+    """
     r1 = _schtasks("/Delete", "/F", "/TN", TASK_DAEMON)
     r2 = _schtasks("/Delete", "/F", "/TN", TASK_HEAL)
     ok = not (r1.returncode and r2.returncode)

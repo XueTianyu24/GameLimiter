@@ -175,4 +175,47 @@ played = db.games_played_between(conn, day0, day1)
 assert set(played) == {gA.id, gB.id}, played
 assert db.games_played_between(conn, day1, day1 + 86400) == {}  # 明天还是空的
 
+# ---- 拆除强制层：也是放宽，也走 24h（v0.18.0）----
+from gamelimiter import setup_system
+
+conn.execute("DELETE FROM pending_changes")   # 前面几段留下的申请会干扰这里的落地计数
+conn.commit()
+setup_system.is_configured = lambda: False
+assert changes.request_remove_system(conn)[0] == "nochange"      # 没配置就没什么可拆
+
+setup_system.is_configured = lambda: True
+removed = []
+setup_system.remove_now = lambda: (removed.append(1), True)[1]
+
+status, apply_at, msg = changes.request_remove_system(conn)
+assert status == "delayed" and apply_at > time.time() + 23 * 3600, msg
+pend = [p for p in changes.global_pendings(conn) if p["field"] == changes.REMOVE_SYSTEM]
+assert len(pend) == 1
+assert "拆除强制层" in changes.describe_pending(pend[0])
+
+# 重复申请不重新计时（等了 20 小时再点一次，剩的还是 4 小时）
+again = changes.request_remove_system(conn)
+assert again[0] == "pending" and again[1] == apply_at, again
+
+# 未到期不落地，到期才真删
+assert not removed
+seen = []
+assert changes.apply_due(conn, apply_at - 1,
+                         on_applied=lambda f, gid: seen.append(f)) == 0
+assert changes.apply_due(conn, apply_at + 1,
+                         on_applied=lambda f, gid: seen.append(f)) == 1
+assert removed == [1] and seen == [changes.REMOVE_SYSTEM]
+assert not [p for p in changes.global_pendings(conn) if p["field"] == changes.REMOVE_SYSTEM]
+
+# 删不掉（权限不够）→ 申请留着，5 分钟后重试，不是默默作废
+setup_system.remove_now = lambda: False
+_, apply_at, _ = changes.request_remove_system(conn)
+assert changes.apply_due(conn, apply_at + 1) == 0
+pend = [p for p in changes.global_pendings(conn) if p["field"] == changes.REMOVE_SYSTEM]
+assert len(pend) == 1 and pend[0]["apply_at"] > apply_at
+
+# 冷静期内随时可以撤销
+changes.cancel_pending(conn, pend[0]["id"])
+assert not [p for p in changes.global_pendings(conn) if p["field"] == changes.REMOVE_SYSTEM]
+
 print("test_changes: 全部通过")
